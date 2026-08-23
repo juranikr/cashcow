@@ -43,3 +43,12 @@ variable "listener_rule_priority" {
   default = 210
 }
 
+variable "github_org" {
+  type    = string
+  default = "juranikr"
+}
+
+variable "github_repo" {
+  type    = string
+  default = "cashcow"
+}

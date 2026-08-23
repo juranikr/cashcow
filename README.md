@@ -9,11 +9,11 @@
 - 34칸 청취 반경과 실제로 들은 에이전트에게만 전달되는 `@이름` 명령
 - 순간이동 없는 A* 격자 이동과 자율 도구 순환
 - 우클릭/클릭 에이전트 상세: 현재 플랜, 단계 상태, 정제된 도구 입력·출력, 기억·교훈
-- 화이트보드 제목, 글 영역, 16×10 도트 그림, 버전 충돌 방지 저장
+- 화이트보드 제목, 배치 가능한 글 영역, 256×256 연속 도트 그림, 작성자·버전 이력
 - 4대의 컴퓨터별 1인 점유와 인터넷 검색·스크립트·공용 정보 작업 지시
 - 물리적 좌석 도착과 정족수를 전제로 한 회의 소집
 - 주간 개인·팀 평가, 미평가 주기의 `no_review` 마감, 평가 기반 행동 정책·교훈 갱신
-- ChatGPT 사용자 식별, D1 영속 저장, 서버 전용 Groq 호출과 비밀값 마스킹
+- 브라우저가 모두 닫혀도 실행되는 ECS 월드, DynamoDB 영속 상태, 서버 전용 Groq 호출과 비밀값 마스킹
 
 ## 로컬 실행
 
@@ -50,6 +50,8 @@ npm run build
 | `GROQ_API_KEY` | 서버에서만 사용하는 Groq API 키 |
 | `GROQ_MODEL` | 기본값 `openai/gpt-oss-120b` |
 | `SITE_ORIGIN` | Open Graph 절대 URL 기준 주소 |
+| `RUNTIME_BASE_URL` | 브라우저 독립 영속 월드 HTTPS 주소 |
+| `RUNTIME_SERVICE_TOKEN` | Sites와 런타임 사이의 서버 전용 인증 토큰 |
 
 `.env.local`은 Git에서 제외됩니다. 키·원문 모델 사고과정·비정제 웹 문서는 도구 히스토리에 저장하지 않습니다.
 
@@ -58,4 +60,9 @@ npm run build
 - [제품 및 기술 아키텍처](docs/ARCHITECTURE.md)
 - [cloudmiddle 방식 AWS 운영 전환](docs/CLOUDMIDDLE_DEPLOYMENT.md)
 
-이 저장소는 조작 가능한 MVP입니다. 브라우저 간 완전한 실시간 월드와 24시간 백그라운드 에이전트 실행은 별도 authoritative world service가 필요한 운영 확장 단계입니다.
+## GitHub 자동배포
+
+`main`의 런타임 변경은 GitHub OIDC로 AWS에 인증한 뒤 ECR과 ECS에 자동
+배포됩니다. 장기 AWS 키와 Groq 키는 GitHub에 저장하지 않습니다. Sites
+화면 변경은 모든 빌드 검사를 자동 수행하고, ChatGPT 로그인·D1 바인딩을
+소유한 Sites 배포 경로에서 게시합니다.

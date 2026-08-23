@@ -6,3 +6,7 @@ output "secret_arn" {
   sensitive = true
 }
 output "runtime_base_url" { value = "https://d232kzujcg4ufp.cloudfront.net" }
+output "github_actions_role_arn" {
+  value       = aws_iam_role.github_actions.arn
+  description = "GitHub Actions OIDC role for juranikr/cashcow"
+}
