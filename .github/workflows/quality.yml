@@ -21,6 +21,7 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
+      - run: python -m pip install -r runtime/requirements.txt
       - run: python -m py_compile runtime/main.py runtime/engine.py runtime/storage.py runtime/world.py
       - run: python -m unittest discover -s runtime -p 'test_*.py' -v
       - run: npm run typecheck

@@ -31,6 +31,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install runtime dependencies
+        run: python -m pip install -r runtime/requirements.txt
+
       - name: Validate persistent runtime
         run: |
           python -m py_compile runtime/main.py runtime/engine.py runtime/storage.py runtime/world.py
@@ -84,4 +87,3 @@ jobs:
         run: |
           set -euo pipefail
           curl --fail --silent --show-error --retry 6 --retry-delay 5 "$HEALTH_URL" >/dev/null
-
