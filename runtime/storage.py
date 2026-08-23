@@ -302,17 +302,17 @@ class DynamoStore:
         for message in after.get("messages", []):
             if message["id"] not in before_message_ids:
                 items.append(self._json_item("FEED#messages", f"{message['at']}#{message['id']}", "message", message))
-        before_report_ids = {item["id"] for item in before.get("reports", [])}
+        before_reports = {item["id"]: item for item in before.get("reports", [])}
         for report in after.get("reports", []):
-            if report["id"] not in before_report_ids:
+            if before_reports.get(report["id"]) != report:
                 items.append(self._json_item("REPORTS", f"{report['createdAt']}#{report['id']}", "report", report))
         before_versions = before.get("boardVersions", {})
         for version, document in after.get("boardVersions", {}).items():
             if before_versions.get(version) != document:
                 items.append(self._json_item("BOARD#main", f"VERSION#{int(version):08d}", "board_version", document))
-        before_knowledge_ids = {item["id"] for item in before.get("knowledge", [])}
+        before_knowledge = {item["id"]: item for item in before.get("knowledge", [])}
         for knowledge in after.get("knowledge", []):
-            if knowledge["id"] not in before_knowledge_ids:
+            if before_knowledge.get(knowledge["id"]) != knowledge:
                 items.append(self._json_item("KNOWLEDGE", f"{knowledge['createdAt']}#{knowledge['id']}", "knowledge", knowledge))
 
         commit = self._json_item("META#world", "COMMIT", "commit", {"revision": int(after["revision"])}, revision=int(after["revision"]))

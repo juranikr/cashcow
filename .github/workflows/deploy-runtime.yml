@@ -58,6 +58,7 @@ jobs:
           set -euo pipefail
           docker build \
             -f runtime/Dockerfile \
+            --build-arg "RUNTIME_BUILD_SHA=$IMAGE_TAG" \
             -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
             -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
             runtime
@@ -84,6 +85,9 @@ jobs:
       - name: Verify production runtime
         env:
           HEALTH_URL: ${{ vars.RUNTIME_HEALTH_URL }}
+          EXPECTED_BUILD_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --retry 6 --retry-delay 5 "$HEALTH_URL" >/dev/null
+          health_json="$(curl --fail --silent --show-error --retry 6 --retry-delay 5 "$HEALTH_URL?build=$EXPECTED_BUILD_SHA")"
+          actual_build_sha="$(jq -r '.buildSha // empty' <<<"$health_json")"
+          test "$actual_build_sha" = "$EXPECTED_BUILD_SHA"

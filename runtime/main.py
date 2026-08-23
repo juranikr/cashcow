@@ -46,6 +46,11 @@ class ReviewInput(BaseModel):
     actorId: str = Field(min_length=1, max_length=180)
 
 
+class InvalidateInput(BaseModel):
+    reason: str = Field(min_length=1, max_length=1000)
+    actorId: str = Field(min_length=1, max_length=180)
+
+
 class BoardInput(BaseModel):
     title: str = Field(min_length=1, max_length=40)
     palette: list[str] = Field(min_length=1, max_length=32)
@@ -127,8 +132,10 @@ def engine(request: Request) -> WorldEngine:
 
 @app.get("/cashcow/health")
 async def health(request: Request):
-    snapshot = await engine(request).snapshot()
-    return {"status": "ok", "worldVersion": snapshot["worldVersion"], "paused": snapshot["agentsPaused"]}
+    value = await engine(request).runtime_health()
+    if value["status"] != "ok":
+        return JSONResponse(value, status_code=503)
+    return value
 
 
 @app.get("/cashcow/api/bootstrap", dependencies=[Depends(authorize)])
@@ -183,6 +190,16 @@ async def job_detail(request: Request, job_id: str):
         return await engine(request).job_detail(job_id)
     except KeyError as error:
         raise HTTPException(404, str(error).strip("'")) from error
+
+
+@app.post("/cashcow/api/jobs/{job_id}/invalidate", dependencies=[Depends(authorize)])
+async def invalidate_job(request: Request, job_id: str, value: InvalidateInput):
+    try:
+        return await engine(request).invalidate_job_artifacts(job_id, value.reason, value.actorId)
+    except KeyError as error:
+        raise HTTPException(404, str(error).strip("'")) from error
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
 
 
 @app.post("/cashcow/api/reviews", dependencies=[Depends(authorize)])
