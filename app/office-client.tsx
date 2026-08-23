@@ -118,30 +118,33 @@ function preferredMeetingSeat(agentId: string) {
   return MEETING_SEATS.find((seat) => seat.id === `seat-${agentId}`) ?? MEETING_SEATS[0];
 }
 
-function PixelAgent({ agent, selected, observed, onSelect }: { agent: AgentModel; selected: boolean; observed: boolean; onSelect: (event: ReactMouseEvent) => void }) {
+function PixelAgent({ agent, selected, observed, paused, onSelect }: { agent: AgentModel; selected: boolean; observed: boolean; paused: boolean; onSelect: (event: ReactMouseEvent) => void }) {
   return (
     <button
       className={`pixel-agent ${selected ? 'selected' : ''} ${observed ? 'in-view' : 'out-of-view'}`}
       style={{ left: `${agent.position.x}%`, top: `${agent.position.y}%` }}
       onClick={onSelect}
       onContextMenu={onSelect}
-      aria-label={`${agent.name}, ${agent.activity}. ${observed ? '시야 안' : '선택 에이전트의 시야 밖'}`}
+      aria-label={`${agent.name}, ${paused ? `일시정지 · ${agent.activity}` : agent.activity}. ${observed ? '시야 안' : '선택 에이전트의 시야 밖'}`}
       type="button"
     >
-      <span className="agent-label"><strong>{agent.name}</strong> · {agent.activity}</span>
+      <span className="agent-label"><strong>{agent.name}</strong> · {paused ? '일시정지' : agent.activity}</span>
       <span className={`agent-sprite ${agent.tone} face-${agent.facing}`} aria-hidden="true"><i className="agent-hair" /><i className="agent-face" /><i className="agent-body" /></span>
       {agent.currentTool && <span className="working-pulse" />}
     </button>
   );
 }
 
-export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; initialNow: string }) {
+export default function OfficeClient({ viewer, canControlAgents, initialNow }: { viewer: Viewer; canControlAgents: boolean; initialNow: string }) {
   const [agents, setAgents] = useState(INITIAL_AGENTS);
   const [selectedId, setSelectedId] = useState('minji');
   const [detailTab, setDetailTab] = useState<DetailTab>('plan');
   const [player, setPlayer] = useState({ x: 49, y: 54 });
   const [playerFacing, setPlayerFacing] = useState<'north' | 'east' | 'south' | 'west'>('south');
   const [visionLayer, setVisionLayer] = useState(true);
+  const [agentsPaused, setAgentsPaused] = useState(false);
+  const [controlReady, setControlReady] = useState(false);
+  const [controlSaving, setControlSaving] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([
     { id: 'hello', speaker: '민지', body: '대표님, 이번 스프린트 조사 기준을 먼저 정리하고 있어요.', at: iso(3), kind: 'agent', heardBy: ['대표님'] },
   ]);
@@ -156,6 +159,12 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
   const [observationLog, setObservationLog] = useState<Array<{ id: string; body: string; at: string }>>([]);
   const keys = useRef(new Set<string>());
   const previousVisible = useRef(new Set<string>());
+  const agentsPausedRef = useRef(false);
+  const agentRequests = useRef(new Set<AbortController>());
+  const reviewRequest = useRef<AbortController | null>(null);
+  const controlReadSequence = useRef(0);
+  const controlSavingRef = useRef(false);
+  const controlChannel = useRef<BroadcastChannel | null>(null);
 
   const selected = agents.find((agent) => agent.id === selectedId) ?? agents[0];
   const reviewCycle = useMemo(() => kstReviewCycle(clock), [clock]);
@@ -172,16 +181,79 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
   }, []);
 
   useEffect(() => {
+    const sequence = ++controlReadSequence.current;
     fetch('/api/bootstrap')
       .then(async (response) => {
         if (!response.ok) throw new Error('bootstrap unavailable');
-        return response.json() as Promise<{ whiteboard?: WhiteboardState; reviewSubmitted?: boolean }>;
+        return response.json() as Promise<{ whiteboard?: WhiteboardState; reviewSubmitted?: boolean; agentsPaused?: boolean }>;
       })
-      .then((data: { whiteboard?: WhiteboardState; reviewSubmitted?: boolean }) => {
+      .then((data: { whiteboard?: WhiteboardState; reviewSubmitted?: boolean; agentsPaused?: boolean }) => {
+        if (sequence !== controlReadSequence.current) return;
         if (data.whiteboard) setWhiteboard({ ...data.whiteboard, pixels: data.whiteboard.pixels.length === 160 ? data.whiteboard.pixels : DEFAULT_PIXELS });
         setReviewSubmitted(Boolean(data.reviewSubmitted));
+        agentsPausedRef.current = Boolean(data.agentsPaused);
+        setAgentsPaused(Boolean(data.agentsPaused));
       })
-      .catch(() => setToast('로컬 월드로 시작했습니다. 저장 API를 다시 연결하는 중입니다.'));
+      .catch(() => {
+        if (sequence !== controlReadSequence.current) return;
+        agentsPausedRef.current = true;
+        setAgentsPaused(true);
+        setToast('활동 상태를 확인하지 못해 안전을 위해 에이전트를 정지했습니다.');
+      })
+      .finally(() => { if (sequence === controlReadSequence.current) setControlReady(true); });
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const syncControl = async () => {
+      if (controlSavingRef.current) return;
+      const sequence = ++controlReadSequence.current;
+      try {
+        const response = await fetch('/api/world-control', { cache: 'no-store' });
+        if (!response.ok) throw new Error('control unavailable');
+        const data = await response.json() as { agentsPaused?: unknown };
+        if (typeof data.agentsPaused !== 'boolean') throw new Error('invalid control state');
+        if (disposed || sequence !== controlReadSequence.current) return;
+        agentsPausedRef.current = data.agentsPaused;
+        setAgentsPaused(data.agentsPaused);
+        if (data.agentsPaused) {
+          agentRequests.current.forEach((controller) => controller.abort());
+          agentRequests.current.clear();
+          reviewRequest.current?.abort();
+          reviewRequest.current = null;
+        }
+        setControlReady(true);
+      } catch {
+        if (disposed || sequence !== controlReadSequence.current) return;
+        agentsPausedRef.current = true;
+        setAgentsPaused(true);
+        agentRequests.current.forEach((controller) => controller.abort());
+        agentRequests.current.clear();
+        reviewRequest.current?.abort();
+        reviewRequest.current = null;
+        setControlReady(true);
+        setToast('활동 상태 동기화에 실패해 안전을 위해 에이전트를 정지했습니다.');
+      }
+    };
+    const syncWhenVisible = () => { if (document.visibilityState === 'visible') void syncControl(); };
+    const timer = window.setInterval(syncWhenVisible, 30_000);
+    window.addEventListener('focus', syncWhenVisible);
+    document.addEventListener('visibilitychange', syncWhenVisible);
+    if ('BroadcastChannel' in window) {
+      const channel = new BroadcastChannel('cashcow-agent-control');
+      controlChannel.current = channel;
+      channel.addEventListener('message', (event: MessageEvent<{ type?: unknown }>) => {
+        if (event.data?.type === 'world-control-changed') void syncControl();
+      });
+    }
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      window.removeEventListener('focus', syncWhenVisible);
+      document.removeEventListener('visibilitychange', syncWhenVisible);
+      controlChannel.current?.close();
+      controlChannel.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -189,6 +261,13 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
     const timer = window.setTimeout(() => setToast(''), 3200);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => () => {
+    agentRequests.current.forEach((controller) => controller.abort());
+    agentRequests.current.clear();
+    reviewRequest.current?.abort();
+    reviewRequest.current = null;
+  }, []);
 
   useEffect(() => {
     const down = (event: KeyboardEvent) => {
@@ -215,8 +294,11 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
   }, []);
 
   useEffect(() => {
+    if (!controlReady || agentsPaused) return;
     const simulation = window.setInterval(() => {
+      if (agentsPausedRef.current) return;
       setAgents((currentAgents) => {
+        if (agentsPausedRef.current) return currentAgents;
         const claimedComputers = new Map(currentAgents.filter((agent) => agent.currentTool === 'computer' && agent.toolStation).map((agent) => [agent.toolStation!, agent.id]));
         return currentAgents.map((agent) => {
           if (agent.currentTool) {
@@ -284,7 +366,7 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
       });
     }, 180);
     return () => window.clearInterval(simulation);
-  }, []);
+  }, [agentsPaused, controlReady]);
 
   useEffect(() => {
     const changes = transitionVisibility(previousVisible.current, visibleIds);
@@ -310,6 +392,7 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
   }
 
   function assignCommand(agentIds: string[], command: string) {
+    if (!controlReady || agentsPausedRef.current) return;
     const tool = targetToolFromCommand(command);
     setAgents((current) => {
       const reserved = new Set(current.filter((agent) => agent.currentTool === 'computer' && !agentIds.includes(agent.id)).map((agent) => agent.toolStation).filter(Boolean));
@@ -333,6 +416,10 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
   }
 
   async function sendCommand(messageOverride?: string) {
+    if (!controlReady || agentsPausedRef.current) {
+      setToast('에이전트가 일시정지 상태입니다. 재개한 뒤 명령해 주세요.');
+      return;
+    }
     const body = (messageOverride ?? draft).trim();
     if (!body) return;
     const mention = agents.find((agent) => body.includes(`@${agent.name}`));
@@ -356,9 +443,12 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
     setSelectedId(primary.id);
     setDetailTab('plan');
     setToast(`${recipients.map((agent) => agent.name).join(', ')}에게 명령이 전달됐습니다.`);
+    const controller = new AbortController();
+    agentRequests.current.add(controller);
     try {
-      const response = await fetch('/api/agent', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ agentId: primary.id, agentName: primary.name, role: primary.role, rank: primary.rank, command: body, nearbyAgents: recipients.map((agent) => agent.name), memories: primary.memories.slice(0, 3) }) });
+      const response = await fetch('/api/agent', { method: 'POST', headers: { 'content-type': 'application/json' }, signal: controller.signal, body: JSON.stringify({ agentId: primary.id, agentName: primary.name, role: primary.role, rank: primary.rank, command: body, nearbyAgents: recipients.map((agent) => agent.name), memories: primary.memories.slice(0, 3) }) });
       const data = await response.json() as { reply?: string; plan?: string[]; lesson?: string; error?: string };
+      if (agentsPausedRef.current) return;
       const reply = data.reply ?? (data.error ? `요청은 접수했지만 사고 엔진 연결이 지연되고 있어요. ${data.error}` : '요청을 접수했고 도구로 이동할게요.');
       setMessages((current) => [...current, { id: crypto.randomUUID(), speaker: primary.name, body: reply, at: new Date().toISOString(), kind: 'agent' as const, heardBy: ['대표님'] }].slice(-20));
       if (data.plan?.length || data.lesson) {
@@ -369,7 +459,10 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
         } : agent));
       }
     } catch {
+      if (controller.signal.aborted || agentsPausedRef.current) return;
       setMessages((current) => [...current, { id: crypto.randomUUID(), speaker: primary.name, body: '네, 요청을 접수했어요. 도구로 이동해 작업을 시작할게요.', at: new Date().toISOString(), kind: 'agent' as const, heardBy: ['대표님'] }].slice(-20));
+    } finally {
+      agentRequests.current.delete(controller);
     }
   }
 
@@ -389,6 +482,10 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
   }
 
   function startMeeting() {
+    if (!controlReady || agentsPausedRef.current) {
+      setToast('에이전트가 일시정지 상태입니다. 재개한 뒤 회의를 소집해 주세요.');
+      return;
+    }
     const command = '회의실에 모여 진행 상황을 공유하고 결과를 평가한 뒤 다음 플랜을 조정해줘';
     assignCommand(agents.map((agent) => agent.id), command);
     setMessages((current) => [...current, { id: crypto.randomUUID(), speaker: '시스템', body: '전원 회의가 소집됐습니다. 에이전트들이 순간이동 없이 회의실로 이동합니다.', at: new Date().toISOString(), kind: 'system' as const }].slice(-20));
@@ -396,16 +493,70 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
     setToast('회의 소집 · 4명이 물리적으로 도착하면 시작됩니다.');
   }
 
-  async function submitReview() {
+  async function toggleAgents() {
+    if (!canControlAgents || !controlReady || controlSaving) return;
+    const previousPaused = agentsPausedRef.current;
+    const nextPaused = !previousPaused;
+    if (nextPaused) {
+      agentsPausedRef.current = true;
+      setAgentsPaused(true);
+      agentRequests.current.forEach((controller) => controller.abort());
+      agentRequests.current.clear();
+      reviewRequest.current?.abort();
+      reviewRequest.current = null;
+    }
+    controlSavingRef.current = true;
+    controlReadSequence.current += 1;
+    setControlSaving(true);
     try {
-      const response = await fetch('/api/reviews', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cycleId: reviewCycle.id, ...reviewScores, agentIds: agents.map((agent) => agent.id) }) });
+      const response = await fetch('/api/world-control', {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ agentsPaused: nextPaused }),
+      });
+      const data = await response.json() as { agentsPaused?: boolean; error?: string };
+      if (!response.ok || typeof data.agentsPaused !== 'boolean') throw new Error(data.error ?? '활동 상태를 저장하지 못했습니다.');
+      agentsPausedRef.current = data.agentsPaused;
+      setAgentsPaused(data.agentsPaused);
+      controlChannel.current?.postMessage({ type: 'world-control-changed' });
+      const body = data.agentsPaused
+        ? '대표가 에이전트 호출과 모든 이동·작업을 일시정지했습니다.'
+        : '대표가 에이전트 활동을 재개했습니다. 에이전트들이 다시 이동하고 작업을 시작합니다.';
+      setMessages((current) => [...current, { id: crypto.randomUUID(), speaker: '시스템', body, at: new Date().toISOString(), kind: 'system' as const }].slice(-20));
+      setToast(data.agentsPaused ? '에이전트 정지 · 이동, 작업, 호출이 멈췄습니다.' : '에이전트 재개 · 이동과 작업을 다시 시작합니다.');
+    } catch (error) {
+      const safePaused = nextPaused || previousPaused;
+      agentsPausedRef.current = safePaused;
+      setAgentsPaused(safePaused);
+      const message = error instanceof Error ? error.message : '활동 상태를 저장하지 못했습니다.';
+      setToast(nextPaused ? `${message} 현재 화면은 정지 상태로 유지됩니다.` : message);
+    } finally {
+      controlSavingRef.current = false;
+      setControlSaving(false);
+    }
+  }
+
+  async function submitReview() {
+    if (!controlReady || agentsPausedRef.current) {
+      setToast('에이전트가 일시정지 상태입니다. 재개한 뒤 평가를 반영해 주세요.');
+      return;
+    }
+    const controller = new AbortController();
+    reviewRequest.current = controller;
+    try {
+      const response = await fetch('/api/reviews', { method: 'POST', headers: { 'content-type': 'application/json' }, signal: controller.signal, body: JSON.stringify({ cycleId: reviewCycle.id, ...reviewScores, agentIds: agents.map((agent) => agent.id) }) });
       if (!response.ok) throw new Error('평가를 저장하지 못했습니다.');
+      if (controller.signal.aborted || agentsPausedRef.current) return;
       const lessonText = reviewScores.comment.trim() || `개인 ${reviewScores.individual}점, 팀 ${reviewScores.team}점 평가를 다음 작업 정책에 반영한다.`;
       setAgents((current) => current.map((agent) => ({ ...agent, score: Math.round((agent.score * .8) + ((reviewScores.individual + reviewScores.team) * 10) * .2), memories: [{ id: crypto.randomUUID(), kind: 'lesson' as const, at: new Date().toISOString(), summary: lessonText, evidence: `weekly_review_${reviewCycle.id}`, confidence: .95 }, ...agent.memories].slice(0, 10) })));
       setReviewSubmitted(true);
       setModal(null);
       setToast('주간 평가가 저장됐고 에이전트들이 행동을 교훈으로 전환했습니다.');
-    } catch (error) { setToast(error instanceof Error ? error.message : '평가 저장에 실패했습니다.'); }
+    } catch (error) {
+      if (!controller.signal.aborted) setToast(error instanceof Error ? error.message : '평가 저장에 실패했습니다.');
+    } finally {
+      if (reviewRequest.current === controller) reviewRequest.current = null;
+    }
   }
 
   function paintPixel(index: number) {
@@ -420,13 +571,15 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
         <div className="brand-lockup"><span className="brand-mark" aria-hidden="true">C</span><div><strong>CASHCOW HQ</strong><small>{viewer?.displayName ?? '대표님'} · 에이전트 {agents.length}명 근무 중</small></div></div>
         <div className="world-controls">
           <button className={visionLayer ? 'active' : ''} type="button" onClick={() => setVisionLayer((value) => !value)}>시야 레이어</button>
-          <span className="world-status"><i className="live-dot" /> LIVE <b>{formatTime(clock)}</b></span>
+          {canControlAgents && <button className={`agent-power-toggle ${agentsPaused ? 'paused' : ''}`} type="button" aria-pressed={agentsPaused} aria-busy={controlSaving} aria-label={agentsPaused ? '에이전트 활동 재개' : '에이전트 활동 정지'} onClick={() => void toggleAgents()} disabled={!controlReady || controlSaving}><span aria-hidden="true">{agentsPaused ? '▶' : 'Ⅱ'}</span>{controlSaving ? '저장 중' : agentsPaused ? '에이전트 재개' : '에이전트 정지'}</button>}
+          <span className={`world-status ${agentsPaused ? 'paused' : ''}`}><i className="live-dot" /> {!controlReady ? 'SYNC' : agentsPaused ? 'PAUSED' : 'LIVE'} <b>{formatTime(clock)}</b></span>
         </div>
         <button className={`review-button ${!reviewSubmitted ? 'has-alert' : ''}`} type="button" onClick={() => setModal('review')}>주간 평가 <span>{reviewSubmitted ? '완료' : `${reviewCycle.daysLeft}일 남음`}</span></button>
       </header>
 
       <section className="workspace">
-        <div className="world-frame" aria-label="위에서 내려다본 픽셀 사무실">
+        <div className={`world-frame ${agentsPaused ? 'agents-paused' : ''}`} aria-label={`위에서 내려다본 픽셀 사무실 · 에이전트 ${agentsPaused ? '일시정지' : '활동 중'}`}>
+          {agentsPaused && <div className="pause-banner"><b>에이전트 일시정지</b><span>이동 · 작업 · 호출 중단</span></div>}
           {visionLayer && <div className="vision-cone" style={{ left: `${selected.position.x}%`, top: `${selected.position.y}%`, transform: `translateY(-50%) rotate(${rotation})` }} />}
           <div className="room-label meeting-label">MEETING ROOM</div><div className="room-label lab-label">FOCUS LAB</div>
           <button className="room meeting-room tool-button" type="button" onClick={() => setModal('meeting-room')} aria-label="회의실 열기"><div className="meeting-table"><i /><i /><i /><i /><i /><i /></div><span className="door meeting-door">▾</span></button>
@@ -436,16 +589,16 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
           <div className="lounge-rug"><span /><span /><i /></div>
           <button className="whiteboard-object tool-button" type="button" onClick={() => setModal('whiteboard')} aria-label="화이트보드 열기"><b>{whiteboard.title}</b><span>{whiteboard.text}</span><em>열기</em></button>
           <div className="plant plant-one" /><div className="plant plant-two" /><div className="window-strip" aria-hidden="true"><i /><i /><i /><i /></div>
-          {agents.map((agent) => <PixelAgent key={agent.id} agent={agent} selected={agent.id === selectedId} observed={visibleIds.has(agent.id)} onSelect={(event) => selectAgent(event, agent.id)} />)}
+          {agents.map((agent) => <PixelAgent key={agent.id} agent={agent} selected={agent.id === selectedId} observed={visibleIds.has(agent.id)} paused={agentsPaused} onSelect={(event) => selectAgent(event, agent.id)} />)}
           <div className="you-marker" style={{ left: `${player.x}%`, top: `${player.y}%` }}><span className={`agent-sprite violet face-${playerFacing}`}><i className="agent-hair" /><i className="agent-face" /><i className="agent-body" /></span><b>대표님</b><i className="hearing-ring" /></div>
           <div className="chat-stream" aria-live="polite">{messages.slice(-3).map((message) => <p key={message.id} className={message.kind}><b>{message.speaker}</b><span>{message.body}</span></p>)}</div>
-          <div className="map-hint">WASD / 방향키 이동 · 우클릭 업무 보기 · 가구를 클릭해 도구 열기</div>
+          <div className="map-hint">{agentsPaused ? '에이전트 정지 중 · 대표 이동과 업무 열람은 계속 가능' : 'WASD / 방향키 이동 · 우클릭 업무 보기 · 가구를 클릭해 도구 열기'}</div>
           <div className="observation-feed"><b>{selected.name}의 관찰</b>{observationLog.slice(0, 2).map((event) => <span key={event.id}>{event.body}</span>)}</div>
         </div>
 
         <aside className="ops-panel">
-          <div className="panel-heading"><div><small>선택한 에이전트 · 우클릭 상세</small><h2>{selected.name} <span>{selected.role} · {selected.rank}</span></h2></div><span className={`status-pill ${selected.currentTool ? 'working' : ''}`}>{selected.currentTool ? '작업' : '이동'}</span></div>
-          <div className="agent-card"><div className={`portrait ${selected.tone}`}><span>{selected.name.slice(0, 1)}</span></div><div><b>{selected.focus}</b><p>{selected.activity}</p></div><strong>{Math.round(selected.progress)}%</strong></div>
+          <div className="panel-heading"><div><small>선택한 에이전트 · 우클릭 상세</small><h2>{selected.name} <span>{selected.role} · {selected.rank}</span></h2></div><span className={`status-pill ${agentsPaused ? 'paused' : selected.currentTool ? 'working' : ''}`}>{agentsPaused ? '정지' : selected.currentTool ? '작업' : '이동'}</span></div>
+          <div className="agent-card"><div className={`portrait ${selected.tone}`}><span>{selected.name.slice(0, 1)}</span></div><div><b>{selected.focus}</b><p>{agentsPaused ? `일시정지 · ${selected.activity}` : selected.activity}</p></div><strong>{Math.round(selected.progress)}%</strong></div>
           <div className="progress-track"><i style={{ width: `${selected.progress}%` }} /></div>
           <div className="agent-metrics"><span><b>{selected.score}</b>성과</span><span><b>{Math.round(distance(player, selected.position))}</b>거리</span><span><b>{canSee(selected, player) ? 'ON' : 'OFF'}</b>대표 시야</span></div>
           <div className="detail-tabs" role="tablist">{(['plan', 'history', 'memory'] as DetailTab[]).map((tab) => <button key={tab} type="button" role="tab" aria-selected={detailTab === tab} className={detailTab === tab ? 'active' : ''} onClick={() => setDetailTab(tab)}>{tab === 'plan' ? '플랜' : tab === 'history' ? '도구 기록' : '기억·교훈'}</button>)}</div>
@@ -458,14 +611,14 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
 
       <footer className="chat-dock">
         <button className="nearby" type="button" onClick={() => setModal('notifications')}><span className="sound-icon">◖</span><div><b>근처 대화</b><small>{nearby.length}명이 들을 수 있는 거리</small></div></button>
-        <form className="chat-form" onSubmit={submitChat}><label className="chat-input"><span>@</span><input value={draft} onChange={(event) => setDraft(event.target.value)} aria-label="에이전트에게 메시지" placeholder="예: @민지 경쟁사 3곳을 조사해서 보드에 정리해줘" maxLength={800} /><kbd>Enter</kbd></label><button type="submit" className="send-button">전송</button></form>
+        <form className="chat-form" onSubmit={submitChat}><label className="chat-input"><span>@</span><input value={draft} onChange={(event) => setDraft(event.target.value)} aria-label="에이전트에게 메시지" placeholder={agentsPaused ? '에이전트가 정지되어 호출할 수 없습니다.' : '예: @민지 경쟁사 3곳을 조사해서 보드에 정리해줘'} maxLength={800} disabled={!controlReady || agentsPaused} /><kbd>Enter</kbd></label><button type="submit" className="send-button" disabled={!controlReady || agentsPaused}>전송</button></form>
       </footer>
 
       {modal && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setModal(null); }}><section className={`modal-card ${modal}`} role="dialog" aria-modal="true" aria-label="도구 상세"><button className="modal-close" type="button" onClick={() => setModal(null)} aria-label="닫기">×</button>
         {modal === 'whiteboard' && <><header><small>공용 도구 · 버전 {whiteboard.version}</small><h2>화이트보드</h2><p>제목으로 용도를 알리고 글 영역과 16×10 도트 영역을 함께 편집합니다.</p></header><div className="board-editor"><div className="board-copy"><label>보드 타이틀<input value={whiteboard.title} maxLength={30} onChange={(event) => setWhiteboard((state) => ({ ...state, title: event.target.value }))} /></label><label>글 영역<textarea value={whiteboard.text} maxLength={400} onChange={(event) => setWhiteboard((state) => ({ ...state, text: event.target.value }))} /></label><div className="palette">{PIXEL_COLORS.map((item) => <button key={item} className={color === item ? 'selected' : ''} style={{ background: item }} onClick={() => setColor(item)} type="button" aria-label={`색상 ${item}`} />)}</div></div><div className="pixel-canvas">{whiteboard.pixels.map((pixel, index) => <button key={index} type="button" onPointerDown={() => paintPixel(index)} style={{ background: pixel }} aria-label={`도트 ${index + 1}`} />)}</div></div><footer><button type="button" className="secondary-button" onClick={() => setWhiteboard((state) => ({ ...state, pixels: Array(160).fill(PIXEL_COLORS[0]) }))}>도트 지우기</button><button type="button" className="primary-button" onClick={() => void saveWhiteboard()}>공용 보드에 저장</button></footer></>}
-        {modal === 'computer' && <><header><small>한 자리당 한 명만 사용</small><h2>오피스 컴퓨터</h2><p>검색·스크립트·공용 정보 작업은 에이전트가 컴퓨터까지 이동해 점유한 뒤 실행합니다.</p></header><div className="computer-grid">{computerOwners.map(({ station, owner }, index) => <article key={station.id} className={owner ? 'occupied' : ''}><span className="monitor-icon">▣</span><div><b>컴퓨터 {String(index + 1).padStart(2, '0')}</b><small>{owner ? `${owner.name} · ${owner.focus}` : '사용 가능'}</small></div><em>{owner ? '점유 중' : '비어 있음'}</em></article>)}</div><div className="computer-actions"><button type="button" onClick={() => { setModal(null); void sendCommand(`@${selected.name} 인터넷에서 최신 근거를 조사하고 출처를 정리해줘`); }}>인터넷 검색 지시</button><button type="button" onClick={() => { setModal(null); void sendCommand(`@${selected.name} 안전한 자동화 스크립트를 작성하고 결과를 검증해줘`); }}>스크립트 작성 지시</button><button type="button" onClick={() => { setModal(null); void sendCommand(`@${selected.name} 공용 정보에서 관련 기록을 찾아 새 결과를 등록해줘`); }}>공용 정보 지시</button></div></>}
-        {modal === 'meeting-room' && <><header><small>물리적 참석 · 정족수 3명</small><h2>주간 조정 회의</h2><p>도착한 에이전트들이 진행 상황을 공유하고 서로 평가한 뒤 플랜을 조정합니다.</p></header><div className="attendee-list">{agents.map((agent) => { const seat = preferredMeetingSeat(agent.id); const gap = distance(agent.position, seat.position); return <article key={agent.id}><span className={`mini-avatar ${agent.tone}`}>{agent.name.slice(0,1)}</span><div><b>{agent.name} · {agent.team}</b><small>{gap < 3 ? '회의실 좌석 도착' : `${Math.round(gap)}칸 거리 · ${agent.activity}`}</small></div></article>; })}</div><footer><span>현재 도착 {agents.filter((agent) => distance(agent.position, preferredMeetingSeat(agent.id).position) < 3).length}/4</span><button className="primary-button" type="button" onClick={startMeeting}>전원 회의 소집</button></footer></>}
-        {modal === 'review' && <><header><small>{reviewCycle.id} 주간 · 대표 전용</small><h2>개인·팀 성과 평가</h2><p>평가가 없으면 다음 주기 시작 시 ‘평가 없음’으로 마감됩니다. 점수와 피드백은 에이전트의 다음 행동 정책에 반영됩니다.</p></header>{reviewSubmitted ? <div className="review-complete"><span>✓</span><h3>이번 주 평가 완료</h3><p>에이전트들은 피드백과 이전 행동을 근거로 새 교훈을 만들었습니다.</p></div> : <div className="review-form"><label>개인 성과 <output>{reviewScores.individual}/5</output><input type="range" min="1" max="5" value={reviewScores.individual} onChange={(event) => setReviewScores((state) => ({ ...state, individual: Number(event.target.value) }))} /></label><label>팀 성과 <output>{reviewScores.team}/5</output><input type="range" min="1" max="5" value={reviewScores.team} onChange={(event) => setReviewScores((state) => ({ ...state, team: Number(event.target.value) }))} /></label><label>행동 피드백<textarea placeholder="예: 결과 공유는 좋았지만 출처를 더 일찍 확인해 주세요." value={reviewScores.comment} onChange={(event) => setReviewScores((state) => ({ ...state, comment: event.target.value }))} /></label><button className="primary-button" type="button" onClick={() => void submitReview()}>평가 제출 및 회고 시작</button></div>}</>}
+        {modal === 'computer' && <><header><small>한 자리당 한 명만 사용</small><h2>오피스 컴퓨터</h2><p>검색·스크립트·공용 정보 작업은 에이전트가 컴퓨터까지 이동해 점유한 뒤 실행합니다.</p></header><div className="computer-grid">{computerOwners.map(({ station, owner }, index) => <article key={station.id} className={owner ? 'occupied' : ''}><span className="monitor-icon">▣</span><div><b>컴퓨터 {String(index + 1).padStart(2, '0')}</b><small>{owner ? `${owner.name} · ${owner.focus}` : '사용 가능'}</small></div><em>{owner ? '점유 중' : '비어 있음'}</em></article>)}</div><div className="computer-actions"><button type="button" disabled={!controlReady || agentsPaused} onClick={() => { setModal(null); void sendCommand(`@${selected.name} 인터넷에서 최신 근거를 조사하고 출처를 정리해줘`); }}>인터넷 검색 지시</button><button type="button" disabled={!controlReady || agentsPaused} onClick={() => { setModal(null); void sendCommand(`@${selected.name} 안전한 자동화 스크립트를 작성하고 결과를 검증해줘`); }}>스크립트 작성 지시</button><button type="button" disabled={!controlReady || agentsPaused} onClick={() => { setModal(null); void sendCommand(`@${selected.name} 공용 정보에서 관련 기록을 찾아 새 결과를 등록해줘`); }}>공용 정보 지시</button></div></>}
+        {modal === 'meeting-room' && <><header><small>물리적 참석 · 정족수 3명</small><h2>주간 조정 회의</h2><p>도착한 에이전트들이 진행 상황을 공유하고 서로 평가한 뒤 플랜을 조정합니다.</p></header><div className="attendee-list">{agents.map((agent) => { const seat = preferredMeetingSeat(agent.id); const gap = distance(agent.position, seat.position); return <article key={agent.id}><span className={`mini-avatar ${agent.tone}`}>{agent.name.slice(0,1)}</span><div><b>{agent.name} · {agent.team}</b><small>{gap < 3 ? '회의실 좌석 도착' : `${Math.round(gap)}칸 거리 · ${agent.activity}`}</small></div></article>; })}</div><footer><span>현재 도착 {agents.filter((agent) => distance(agent.position, preferredMeetingSeat(agent.id).position) < 3).length}/4</span><button className="primary-button" type="button" onClick={startMeeting} disabled={!controlReady || agentsPaused}>전원 회의 소집</button></footer></>}
+        {modal === 'review' && <><header><small>{reviewCycle.id} 주간 · 대표 전용</small><h2>개인·팀 성과 평가</h2><p>평가가 없으면 다음 주기 시작 시 ‘평가 없음’으로 마감됩니다. 점수와 피드백은 에이전트의 다음 행동 정책에 반영됩니다.</p></header>{reviewSubmitted ? <div className="review-complete"><span>✓</span><h3>이번 주 평가 완료</h3><p>에이전트들은 피드백과 이전 행동을 근거로 새 교훈을 만들었습니다.</p></div> : <div className="review-form"><label>개인 성과 <output>{reviewScores.individual}/5</output><input type="range" min="1" max="5" value={reviewScores.individual} onChange={(event) => setReviewScores((state) => ({ ...state, individual: Number(event.target.value) }))} /></label><label>팀 성과 <output>{reviewScores.team}/5</output><input type="range" min="1" max="5" value={reviewScores.team} onChange={(event) => setReviewScores((state) => ({ ...state, team: Number(event.target.value) }))} /></label><label>행동 피드백<textarea placeholder="예: 결과 공유는 좋았지만 출처를 더 일찍 확인해 주세요." value={reviewScores.comment} onChange={(event) => setReviewScores((state) => ({ ...state, comment: event.target.value }))} /></label><button className="primary-button" type="button" onClick={() => void submitReview()} disabled={!controlReady || agentsPaused}>평가 제출 및 회고 시작</button></div>}</>}
         {modal === 'notifications' && <><header><small>거리 기반 전달 기록</small><h2>대화와 관찰 로그</h2><p>채팅은 발화 시점에 {HEARING_RADIUS}칸 안에 있던 에이전트에게만 전달됩니다.</p></header><div className="message-log">{messages.slice().reverse().map((message) => <article key={message.id}><header><b>{message.speaker}</b><time>{formatTime(message.at)}</time></header><p>{message.body}</p><small>{message.heardBy?.length ? `들은 사람: ${message.heardBy.join(', ')}` : '시스템 이벤트'}</small></article>)}</div></>}
       </section></div>}
       {toast && <div className="toast" role="status">{toast}</div>}

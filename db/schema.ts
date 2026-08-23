@@ -53,6 +53,13 @@ export const whiteboards = sqliteTable('whiteboards', {
   updatedAt: text('updated_at').notNull(),
 });
 
+export const worldControls = sqliteTable('world_controls', {
+  id: text('id').primaryKey(),
+  agentsPaused: integer('agents_paused', { mode: 'boolean' }).notNull().default(false),
+  updatedBy: text('updated_by').notNull(),
+  updatedAt: text('updated_at').notNull(),
+});
+
 export const reviewCycles = sqliteTable('review_cycles', {
   id: text('id').primaryKey(),
   startsAt: text('starts_at').notNull(),

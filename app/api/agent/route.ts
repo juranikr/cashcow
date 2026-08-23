@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:workers';
 import { NextRequest, NextResponse } from 'next/server';
 import { getActor } from '@/lib/server/auth';
-import { commandRateAllowed, recordAgentCommand } from '@/lib/server/store';
+import { commandRateAllowed, getAgentsPaused, recordAgentCommand } from '@/lib/server/store';
 import { redactSecrets, targetToolFromCommand } from '@/lib/world';
 
 const VALID_AGENTS = new Set(['minji', 'doyun', 'harin', 'jun']);
@@ -33,12 +33,15 @@ function safeGroqResult(value: unknown, fallback: GroqPayload): GroqPayload {
   return { reply, plan: plan.length >= 2 ? plan : fallback.plan, lesson };
 }
 
-async function askGroq(input: { agentName: string; role: string; rank: string; command: string; nearbyAgents: string[]; memories: unknown[] }): Promise<{ value: GroqPayload; engine: 'groq' | 'deterministic' }> {
+async function askGroq(input: { agentName: string; role: string; rank: string; command: string; nearbyAgents: string[]; memories: unknown[] }, requestSignal?: AbortSignal): Promise<{ value: GroqPayload; engine: 'groq' | 'deterministic' }> {
   const fallback = fallbackPlan(input.agentName, input.command);
   const apiKey = env.GROQ_API_KEY || process.env.GROQ_API_KEY;
   if (!apiKey) return { value: fallback, engine: 'deterministic' };
 
   const controller = new AbortController();
+  const abortFromRequest = () => controller.abort();
+  requestSignal?.addEventListener('abort', abortFromRequest, { once: true });
+  if (requestSignal?.aborted) controller.abort();
   const timeout = setTimeout(() => controller.abort(), 12_000);
   try {
     const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -71,6 +74,7 @@ async function askGroq(input: { agentName: string; role: string; rank: string; c
     return { value: fallback, engine: 'deterministic' };
   } finally {
     clearTimeout(timeout);
+    requestSignal?.removeEventListener('abort', abortFromRequest);
   }
 }
 
@@ -83,6 +87,7 @@ export async function POST(request: NextRequest) {
   const value = body as Record<string, unknown>;
   if (typeof value.agentId !== 'string' || !VALID_AGENTS.has(value.agentId)) return NextResponse.json({ error: '알 수 없는 에이전트입니다.' }, { status: 400 });
   if (typeof value.command !== 'string' || !value.command.trim() || value.command.length > 800) return NextResponse.json({ error: '명령은 1~800자여야 합니다.' }, { status: 400 });
+  if (await getAgentsPaused()) return NextResponse.json({ error: '대표가 에이전트 활동을 일시정지했습니다.' }, { status: 423 });
   if (!(await commandRateAllowed(value.agentId))) return NextResponse.json({ error: '명령이 너무 빠릅니다. 잠시 후 다시 시도해 주세요.' }, { status: 429 });
 
   const input = {
@@ -93,8 +98,11 @@ export async function POST(request: NextRequest) {
     nearbyAgents: Array.isArray(value.nearbyAgents) ? value.nearbyAgents.filter((name): name is string => typeof name === 'string').slice(0, 8) : [],
     memories: Array.isArray(value.memories) ? value.memories.slice(0, 3) : [],
   };
-  const result = await askGroq(input);
+  const result = await askGroq(input, request.signal);
+  if (request.signal.aborted) return NextResponse.json({ error: '에이전트 호출이 취소됐습니다.' }, { status: 499 });
+  if (await getAgentsPaused()) return NextResponse.json({ error: '대표가 에이전트 활동을 일시정지했습니다.' }, { status: 423 });
   const tool = targetToolFromCommand(input.command);
-  await recordAgentCommand({ agentId: value.agentId, command: input.command, plan: result.value.plan, reply: result.value.reply, tool, lesson: result.value.lesson });
+  const planId = await recordAgentCommand({ agentId: value.agentId, command: input.command, plan: result.value.plan, reply: result.value.reply, tool, lesson: result.value.lesson });
+  if (!planId) return NextResponse.json({ error: '대표가 에이전트 활동을 일시정지했습니다.' }, { status: 423 });
   return NextResponse.json({ ...result.value, engine: result.engine });
 }

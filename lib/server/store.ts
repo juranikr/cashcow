@@ -53,6 +53,12 @@ const CREATE_STATEMENTS = [
     updated_by TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS world_controls (
+    id TEXT PRIMARY KEY,
+    agents_paused INTEGER NOT NULL DEFAULT 0,
+    updated_by TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`,
   `CREATE TABLE IF NOT EXISTS review_cycles (
     id TEXT PRIMARY KEY,
     starts_at TEXT NOT NULL,
@@ -136,6 +142,10 @@ export async function ensureDatabase(actorId = 'system') {
      VALUES ('main', 'SPRINT 08', '목표 · 진행 · 배운 점', ?, 1, ?, ?)`,
   ).bind(JSON.stringify(DEFAULT_PIXELS), actorId, stamp));
   seeds.push(db().prepare(
+    `INSERT OR IGNORE INTO world_controls (id, agents_paused, updated_by, updated_at)
+     VALUES ('main', 0, ?, ?)`,
+  ).bind(actorId, stamp));
+  seeds.push(db().prepare(
     `INSERT OR IGNORE INTO review_cycles (id, starts_at, ends_at, status, created_at)
      VALUES (?, ?, ?, 'open', ?)`,
   ).bind(cycle.id, cycle.startsAt.toISOString(), cycle.endsAt.toISOString(), stamp));
@@ -157,11 +167,49 @@ export async function getBootstrap(actorId: string) {
   const review = await db().prepare(
     `SELECT id FROM reviews WHERE cycle_id = ? AND reviewer_id = ? LIMIT 1`,
   ).bind(cycle.id, actorId).first<{ id: string }>();
+  const controls = await db().prepare(
+    `SELECT agents_paused FROM world_controls WHERE id = 'main'`,
+  ).first<{ agents_paused: number }>();
   return {
     whiteboard: board ? { title: board.title, text: board.text_content, pixels: JSON.parse(board.pixels_json) as string[], version: board.version } : null,
     reviewSubmitted: Boolean(review),
+    agentsPaused: Boolean(controls?.agents_paused),
     cycle: { id: cycle.id, startsAt: cycle.startsAt.toISOString(), endsAt: cycle.endsAt.toISOString() },
   };
+}
+
+export async function getAgentsPaused() {
+  if (!initialized) await ensureDatabase();
+  const controls = await db().prepare(
+    `SELECT agents_paused FROM world_controls WHERE id = 'main'`,
+  ).first<{ agents_paused: number }>();
+  return Boolean(controls?.agents_paused);
+}
+
+export async function setAgentsPaused(agentsPaused: boolean, actorId: string) {
+  await ensureDatabase(actorId);
+  const updatedAt = new Date().toISOString();
+  await db().batch([
+    db().prepare(
+      `INSERT INTO world_controls (id, agents_paused, updated_by, updated_at)
+       VALUES ('main', ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         agents_paused = excluded.agents_paused,
+         updated_by = excluded.updated_by,
+         updated_at = excluded.updated_at`,
+    ).bind(agentsPaused ? 1 : 0, actorId, updatedAt),
+    db().prepare(
+      `INSERT INTO audit_log (id, actor_id, action, entity_type, entity_id, summary, created_at)
+       VALUES (?, ?, ?, 'world_control', 'main', ?, ?)`,
+    ).bind(
+      crypto.randomUUID(),
+      actorId,
+      agentsPaused ? 'agents_paused' : 'agents_resumed',
+      agentsPaused ? '에이전트 활동 정지' : '에이전트 활동 재개',
+      updatedAt,
+    ),
+  ]);
+  return { agentsPaused, updatedAt };
 }
 
 export async function updateWhiteboard(input: { title: string; text: string; pixels: string[]; expectedVersion: number }, actorId: string) {
@@ -200,20 +248,26 @@ export async function recordAgentCommand(input: { agentId: string; command: stri
   const statements = [
     db().prepare(
       `INSERT INTO plans (id, agent_id, command, steps_json, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, 'active', ?, ?)`,
+       SELECT ?, ?, ?, ?, 'active', ?, ?
+       WHERE EXISTS (SELECT 1 FROM world_controls WHERE id = 'main' AND agents_paused = 0)`,
     ).bind(planId, input.agentId, redactSecrets(input.command), JSON.stringify(input.plan), now, now),
     db().prepare(
       `INSERT INTO run_events (id, plan_id, agent_id, event_type, tool, input_summary, output_summary, result, created_at)
-       VALUES (?, ?, ?, 'command_received', 'nearby_chat', ?, ?, 'success', ?)`,
-    ).bind(crypto.randomUUID(), planId, input.agentId, redactSecrets(input.command), redactSecrets(input.reply), now),
+       SELECT ?, ?, ?, 'command_received', 'nearby_chat', ?, ?, 'success', ?
+       WHERE EXISTS (SELECT 1 FROM plans WHERE id = ?)
+         AND EXISTS (SELECT 1 FROM world_controls WHERE id = 'main' AND agents_paused = 0)`,
+    ).bind(crypto.randomUUID(), planId, input.agentId, redactSecrets(input.command), redactSecrets(input.reply), now, planId),
   ];
   if (input.lesson) {
     statements.push(db().prepare(
       `INSERT INTO memories (id, agent_id, kind, summary, evidence, confidence, created_at)
-       VALUES (?, ?, 'lesson', ?, ?, 75, ?)`,
-    ).bind(crypto.randomUUID(), input.agentId, redactSecrets(input.lesson), `plan_${planId}`, now));
+       SELECT ?, ?, 'lesson', ?, ?, 75, ?
+       WHERE EXISTS (SELECT 1 FROM plans WHERE id = ?)
+         AND EXISTS (SELECT 1 FROM world_controls WHERE id = 'main' AND agents_paused = 0)`,
+    ).bind(crypto.randomUUID(), input.agentId, redactSecrets(input.lesson), `plan_${planId}`, now, planId));
   }
-  await db().batch(statements);
+  const results = await db().batch(statements);
+  if (!Number(results[0].meta.changes ?? 0)) return null;
   return planId;
 }
 
@@ -226,7 +280,8 @@ export async function saveReview(input: { cycleId: string; individual: number; t
   const statements = [
     db().prepare(
       `INSERT INTO reviews (id, cycle_id, reviewer_id, individual_score, team_score, comment, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+       SELECT ?, ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (SELECT 1 FROM world_controls WHERE id = 'main' AND agents_paused = 0)
        ON CONFLICT(cycle_id, reviewer_id) DO UPDATE SET
          individual_score = excluded.individual_score,
          team_score = excluded.team_score,
@@ -234,22 +289,27 @@ export async function saveReview(input: { cycleId: string; individual: number; t
          created_at = excluded.created_at`,
     ).bind(reviewId, input.cycleId, actorId, input.individual, input.team, comment, now),
     db().prepare(
-      `UPDATE review_cycles SET status = 'reviewed' WHERE id = ?`,
+      `UPDATE review_cycles SET status = 'reviewed'
+       WHERE id = ? AND EXISTS (SELECT 1 FROM world_controls WHERE id = 'main' AND agents_paused = 0)`,
     ).bind(input.cycleId),
     db().prepare(
       `INSERT INTO audit_log (id, actor_id, action, entity_type, entity_id, summary, created_at)
-       VALUES (?, ?, 'weekly_review_submitted', 'review_cycle', ?, ?, ?)`,
+       SELECT ?, ?, 'weekly_review_submitted', 'review_cycle', ?, ?, ?
+       WHERE EXISTS (SELECT 1 FROM world_controls WHERE id = 'main' AND agents_paused = 0)`,
     ).bind(crypto.randomUUID(), actorId, input.cycleId, `개인 ${input.individual}/5 · 팀 ${input.team}/5`, now),
   ];
   input.agentIds.forEach((agentId) => {
     statements.push(db().prepare(
       `INSERT INTO memories (id, agent_id, kind, summary, evidence, confidence, created_at)
-       VALUES (?, ?, 'lesson', ?, ?, 95, ?)`,
+       SELECT ?, ?, 'lesson', ?, ?, 95, ?
+       WHERE EXISTS (SELECT 1 FROM world_controls WHERE id = 'main' AND agents_paused = 0)`,
     ).bind(crypto.randomUUID(), agentId, comment || `개인 ${input.individual}점과 팀 ${input.team}점 평가를 다음 행동에 반영한다.`, `weekly_review_${input.cycleId}`, now));
     statements.push(db().prepare(
-      `UPDATE agents SET policy_version = policy_version + 1, score = ?, updated_at = ? WHERE id = ?`,
+      `UPDATE agents SET policy_version = policy_version + 1, score = ?, updated_at = ?
+       WHERE id = ? AND EXISTS (SELECT 1 FROM world_controls WHERE id = 'main' AND agents_paused = 0)`,
     ).bind(Math.round(((input.individual + input.team) / 10) * 100), now, agentId));
   });
-  await db().batch(statements);
+  const results = await db().batch(statements);
+  if (!Number(results[0].meta.changes ?? 0)) throw new Error('에이전트가 일시정지되어 평가를 반영할 수 없습니다.');
   return { reviewId, reflectedAgents: input.agentIds.length };
 }
