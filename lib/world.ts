@@ -19,6 +19,45 @@ export type ToolEvent = {
   result: 'success' | 'working' | 'blocked';
 };
 
+export type PublicDecisionSummary = {
+  observations: string[];
+  objective: string;
+  chosenAction: string;
+  rationale: string;
+  alternatives: Array<{ action: string; rejectedBecause: string }>;
+  evidenceRefs: string[];
+  blockers: string[];
+  confidence: number;
+};
+
+export type WorkEvent = {
+  id: string;
+  planId: string;
+  at: string;
+  type: 'command' | 'decision' | 'tool_request' | 'tool_result' | 'agent_message' | 'verification' | 'status' | 'report';
+  title: string;
+  tool?: string;
+  recipientAgentId?: string;
+  recipientName?: string;
+  input?: string;
+  output?: string;
+  summary?: PublicDecisionSummary;
+  result: 'success' | 'working' | 'blocked';
+};
+
+export type AgentReport = {
+  id: string;
+  planId: string;
+  agentId: string;
+  title: string;
+  outcome: 'completed' | 'partial' | 'failed';
+  summary: string;
+  body: string;
+  limitations: string[];
+  lessons: string[];
+  createdAt: string;
+};
+
 export type Memory = {
   id: string;
   kind: 'episode' | 'lesson';
@@ -48,6 +87,15 @@ export type AgentModel = {
   plan: PlanStep[];
   history: ToolEvent[];
   memories: Memory[];
+  events?: WorkEvent[];
+  report?: AgentReport;
+  activeJob?: {
+    id: string;
+    command: string;
+    status: string;
+    phase: string;
+    createdAt: string;
+  };
 };
 
 export const WORLD_BOUNDS = { minX: 2, maxX: 98, minY: 3, maxY: 96 } as const;

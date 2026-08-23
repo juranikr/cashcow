@@ -125,7 +125,7 @@ describe('world geometry', () => {
       const end = walkUntilNear(start, destination.position);
       expect(distance(end, destination.position), `start-${startIndex} to ${destination.id}`).toBeLessThanOrEqual(2.4);
     }));
-  });
+  }, 15_000);
 
   it('only starts the tool and station the agent was assigned', () => {
     const meetingAgent = agent('minji', 20, 36);

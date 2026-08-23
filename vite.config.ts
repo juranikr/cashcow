@@ -32,6 +32,10 @@ const localBindingConfig = {
         },
       ]
     : [],
+  vars: {
+    RUNTIME_BASE_URL: process.env.RUNTIME_BASE_URL ?? '',
+    RUNTIME_SERVICE_TOKEN: process.env.RUNTIME_SERVICE_TOKEN ?? '',
+  },
 };
 
 export default defineConfig(async () => {

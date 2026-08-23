@@ -1,0 +1,45 @@
+variable "aws_region" {
+  type    = string
+  default = "ap-northeast-2"
+}
+
+variable "name_prefix" {
+  type    = string
+  default = "cashcow-prod"
+}
+
+variable "shared_cluster_name" {
+  type    = string
+  default = "tourmiddle-dev-cluster"
+}
+
+variable "shared_alb_name" {
+  type    = string
+  default = "tourmiddle-dev-alb"
+}
+
+variable "shared_alb_security_group_id" {
+  type    = string
+  default = "sg-08ff7c5ceae900541"
+}
+
+variable "vpc_id" {
+  type    = string
+  default = "vpc-0c1828bb31502023e"
+}
+
+variable "public_subnet_ids" {
+  type    = list(string)
+  default = ["subnet-00db04d04efbf094c", "subnet-099b1fa1d5bd71b89"]
+}
+
+variable "container_port" {
+  type    = number
+  default = 8000
+}
+
+variable "listener_rule_priority" {
+  type    = number
+  default = 210
+}
+

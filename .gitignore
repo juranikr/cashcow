@@ -38,3 +38,11 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+/runtime/.venv/
+/runtime/__pycache__/
+/runtime/*.pyc
+/runtime/local-state*.json
+/runtime/*.log
+/infra/.terraform/
+/infra/*.tfstate*
+/infra/*.tfplan
