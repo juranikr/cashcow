@@ -54,30 +54,35 @@ export const WORLD_BOUNDS = { minX: 2, maxX: 98, minY: 3, maxY: 96 } as const;
 export const HEARING_RADIUS = 34;
 export const VISION_RADIUS = 44;
 export const VISION_ANGLE = 100;
+// Collision is evaluated at a sprite's feet. Pathfinding and movement must use
+// exactly the same clearance or an agent can plan a route it cannot walk.
+export const AGENT_CLEARANCE = 0.45;
 
 const WALL_RECTS: Rect[] = [
   { x: 4, y: 8, width: 34, height: 2 },
   { x: 4, y: 8, width: 2, height: 34 },
-  { x: 36, y: 8, width: 2, height: 25 },
-  { x: 36, y: 37, width: 2, height: 5 },
-  { x: 4, y: 40, width: 24, height: 2 },
-  { x: 32, y: 40, width: 6, height: 2 },
+  { x: 36, y: 8, width: 2, height: 34 },
+  { x: 4, y: 40, width: 14, height: 2 },
+  { x: 24, y: 40, width: 14, height: 2 },
   { x: 58, y: 8, width: 38, height: 2 },
-  { x: 58, y: 8, width: 2, height: 25 },
-  { x: 58, y: 38, width: 2, height: 9 },
+  { x: 58, y: 8, width: 2, height: 39 },
   { x: 94, y: 8, width: 2, height: 39 },
-  { x: 58, y: 45, width: 17, height: 2 },
-  { x: 81, y: 45, width: 15, height: 2 },
+  { x: 58, y: 45, width: 16, height: 2 },
+  { x: 82, y: 45, width: 14, height: 2 },
 ];
 
 const FURNITURE_RECTS: Rect[] = [
   { x: 11, y: 17, width: 21, height: 14 },
-  { x: 65, y: 14, width: 12, height: 7 },
-  { x: 82, y: 14, width: 12, height: 7 },
-  { x: 65, y: 33, width: 12, height: 7 },
-  { x: 82, y: 33, width: 12, height: 7 },
-  { x: 8, y: 68, width: 27, height: 22 },
-  { x: 68, y: 73, width: 27, height: 18 },
+  // Focus lab desks mirror the percentage geometry rendered in globals.css.
+  { x: 61.5, y: 15, width: 12.5, height: 7 },
+  { x: 80, y: 15, width: 12.5, height: 7 },
+  { x: 61.5, y: 34.5, width: 12.5, height: 7 },
+  { x: 80, y: 34.5, width: 12.5, height: 7 },
+  // The rug itself is walkable; only its two seats and table are solid.
+  { x: 10, y: 69, width: 9.5, height: 6.5 },
+  { x: 24.5, y: 81.5, width: 9.5, height: 6.5 },
+  { x: 20, y: 74.5, width: 6.5, height: 8.5 },
+  { x: 65, y: 70, width: 28, height: 22 },
 ];
 
 export const COLLISION_RECTS: Rect[] = [...WALL_RECTS, ...FURNITURE_RECTS];
@@ -85,10 +90,10 @@ export const COLLISION_RECTS: Rect[] = [...WALL_RECTS, ...FURNITURE_RECTS];
 export const VISION_BLOCKERS: Rect[] = COLLISION_RECTS;
 
 export const COMPUTER_STATIONS = [
-  { id: 'pc-01', position: { x: 70, y: 24 } },
-  { id: 'pc-02', position: { x: 87, y: 24 } },
-  { id: 'pc-03', position: { x: 70, y: 41 } },
-  { id: 'pc-04', position: { x: 87, y: 41 } },
+  { id: 'pc-01', position: { x: 68, y: 24 } },
+  { id: 'pc-02', position: { x: 86, y: 24 } },
+  { id: 'pc-03', position: { x: 68, y: 43 } },
+  { id: 'pc-04', position: { x: 86, y: 43 } },
 ] as const;
 
 export const MEETING_SEATS = [
@@ -103,6 +108,25 @@ export const TOOL_SPOTS = {
   computer: COMPUTER_STATIONS[0].position,
   'meeting-room': MEETING_SEATS[0].position,
 } satisfies Record<string, Point>;
+
+export function reachedAssignedTool(
+  agent: Pick<AgentModel, 'target' | 'toolStation' | 'focus'>,
+  position: Point,
+  interactionRadius = 2.4,
+): { tool: keyof typeof TOOL_SPOTS; stationId?: string } | undefined {
+  if (distance(position, agent.target) > interactionRadius) return undefined;
+
+  const computer = COMPUTER_STATIONS.find((station) => station.id === agent.toolStation)
+    ?? COMPUTER_STATIONS.find((station) => distance(station.position, agent.target) < 0.01);
+  if (computer) return { tool: 'computer', stationId: computer.id };
+
+  const seat = MEETING_SEATS.find((station) => station.id === agent.toolStation)
+    ?? MEETING_SEATS.find((station) => distance(station.position, agent.target) < 0.01);
+  if (seat) return { tool: 'meeting-room', stationId: seat.id };
+
+  if (distance(agent.target, TOOL_SPOTS.whiteboard) < 0.01) return { tool: 'whiteboard' };
+  return { tool: targetToolFromCommand(agent.focus) };
+}
 
 const directionVectors: Record<Direction, Point> = {
   north: { x: 0, y: -1 },
@@ -121,7 +145,7 @@ export function directionFromDelta(dx: number, dy: number, fallback: Direction):
   return dy > 0 ? 'south' : 'north';
 }
 
-export function isBlocked(point: Point, padding = 1.2): boolean {
+export function isBlocked(point: Point, padding = AGENT_CLEARANCE): boolean {
   if (point.x < WORLD_BOUNDS.minX || point.x > WORLD_BOUNDS.maxX || point.y < WORLD_BOUNDS.minY || point.y > WORLD_BOUNDS.maxY) return true;
   return COLLISION_RECTS.some((rect) =>
     point.x >= rect.x - padding && point.x <= rect.x + rect.width + padding &&
@@ -129,24 +153,43 @@ export function isBlocked(point: Point, padding = 1.2): boolean {
   );
 }
 
-export function movePoint(point: Point, dx: number, dy: number): Point {
-  const diagonal = dx !== 0 && dy !== 0 ? Math.SQRT1_2 : 1;
-  const nextX = { x: point.x + dx * diagonal, y: point.y };
-  const nextY = { x: point.x, y: point.y + dy * diagonal };
+function moveVector(point: Point, dx: number, dy: number): Point {
+  const nextX = { x: point.x + dx, y: point.y };
+  const nextY = { x: point.x, y: point.y + dy };
   const movedX = isBlocked(nextX) ? point.x : nextX.x;
   const combined = { x: movedX, y: nextY.y };
   return isBlocked(combined) ? { x: movedX, y: point.y } : combined;
 }
 
+export function movePoint(point: Point, dx: number, dy: number): Point {
+  const diagonal = dx !== 0 && dy !== 0 ? Math.SQRT1_2 : 1;
+  return moveVector(point, dx * diagonal, dy * diagonal);
+}
+
 export function stepToward(point: Point, target: Point, maxStep: number): { point: Point; arrived: boolean; facing: Direction } {
   const gap = distance(point, target);
-  if (gap <= maxStep) return { point: target, arrived: true, facing: directionFromDelta(target.x - point.x, target.y - point.y, 'south') };
-  const dx = ((target.x - point.x) / gap) * maxStep;
-  const dy = ((target.y - point.y) / gap) * maxStep;
-  const candidate = movePoint(point, dx, dy);
+  const facing = directionFromDelta(target.x - point.x, target.y - point.y, 'south');
+  if (gap <= maxStep && !isBlocked(target)) return { point: target, arrived: true, facing };
+  if (gap < 0.001) return { point, arrived: false, facing };
+  const step = Math.min(gap, maxStep);
+  const dx = ((target.x - point.x) / gap) * step;
+  const dy = ((target.y - point.y) / gap) * step;
+  // dx/dy are already normalized to maxStep; do not normalize them twice.
+  const candidate = moveVector(point, dx, dy);
   const stuck = distance(candidate, point) < 0.001;
-  const detour = stuck ? movePoint(point, Math.abs(dx) > Math.abs(dy) ? 0 : maxStep, Math.abs(dx) > Math.abs(dy) ? maxStep : 0) : candidate;
-  return { point: detour, arrived: distance(detour, target) <= maxStep, facing: directionFromDelta(detour.x - point.x, detour.y - point.y, 'south') };
+  const detour = stuck
+    ? [
+        moveVector(point, maxStep, 0),
+        moveVector(point, -maxStep, 0),
+        moveVector(point, 0, maxStep),
+        moveVector(point, 0, -maxStep),
+      ].filter((option) => distance(option, point) > 0.001).sort((a, b) => distance(a, target) - distance(b, target))[0] ?? point
+    : candidate;
+  return {
+    point: detour,
+    arrived: distance(detour, target) < 0.001,
+    facing: directionFromDelta(detour.x - point.x, detour.y - point.y, facing),
+  };
 }
 
 type PathNode = { x: number; y: number; key: string; g: number; f: number; parent?: string };
@@ -155,12 +198,12 @@ function gridKey(x: number, y: number): string { return `${x},${y}`; }
 
 function closestOpenGridPoint(point: Point, gridSize: number): Point {
   const base = { x: Math.round(point.x / gridSize) * gridSize, y: Math.round(point.y / gridSize) * gridSize };
-  if (!isBlocked(base, 0.45)) return base;
+  if (!isBlocked(base)) return base;
   for (let radius = 1; radius <= 4; radius += 1) {
     for (let dx = -radius; dx <= radius; dx += 1) {
       for (let dy = -radius; dy <= radius; dy += 1) {
         const candidate = { x: base.x + dx * gridSize, y: base.y + dy * gridSize };
-        if (!isBlocked(candidate, 0.45)) return candidate;
+        if (!isBlocked(candidate)) return candidate;
       }
     }
   }
@@ -188,7 +231,7 @@ export function findNextPathPoint(start: Point, goal: Point, gridSize = 2): Poin
       const x = current.x + dx;
       const y = current.y + dy;
       const key = gridKey(x, y);
-      if (closed.has(key) || isBlocked({ x, y }, 0.45)) return;
+      if (closed.has(key) || isBlocked({ x, y })) return;
       const g = current.g + gridSize;
       const existing = nodes.get(key);
       if (existing && existing.g <= g) return;

@@ -17,6 +17,7 @@ import {
   kstReviewCycle,
   movePoint,
   navigateToward,
+  reachedAssignedTool,
   targetToolFromCommand,
   transitionVisibility,
 } from '@/lib/world';
@@ -115,16 +116,6 @@ function preferredComputer(agentId: string, offset = 0) {
 
 function preferredMeetingSeat(agentId: string) {
   return MEETING_SEATS.find((seat) => seat.id === `seat-${agentId}`) ?? MEETING_SEATS[0];
-}
-
-function nearestTool(position: { x: number; y: number }): { tool: keyof typeof TOOL_SPOTS; stationId?: string } | undefined {
-  const computer = COMPUTER_STATIONS.find((station) => distance(position, station.position) <= 2.4);
-  if (computer) return { tool: 'computer', stationId: computer.id };
-  const seat = MEETING_SEATS.find((station) => distance(position, station.position) <= 2.4);
-  if (seat) return { tool: 'meeting-room', stationId: seat.id };
-  return (Object.entries(TOOL_SPOTS) as Array<[keyof typeof TOOL_SPOTS, { x: number; y: number }]>).filter(([tool]) => tool !== 'computer').find(([, spot]) => distance(position, spot) <= 2.4)
-    ? { tool: (Object.entries(TOOL_SPOTS) as Array<[keyof typeof TOOL_SPOTS, { x: number; y: number }]>).filter(([tool]) => tool !== 'computer').find(([, spot]) => distance(position, spot) <= 2.4)![0] }
-    : undefined;
 }
 
 function PixelAgent({ agent, selected, observed, onSelect }: { agent: AgentModel; selected: boolean; observed: boolean; onSelect: (event: ReactMouseEvent) => void }) {
@@ -259,7 +250,7 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
           }
 
           const navigation = navigateToward(agent.position, agent.target, .72);
-          const reached = nearestTool(navigation.point);
+          const reached = reachedAssignedTool(agent, navigation.point);
           if (!reached) {
             return {
               ...agent,
@@ -440,7 +431,7 @@ export default function OfficeClient({ viewer, initialNow }: { viewer: Viewer; i
           <div className="room-label meeting-label">MEETING ROOM</div><div className="room-label lab-label">FOCUS LAB</div>
           <button className="room meeting-room tool-button" type="button" onClick={() => setModal('meeting-room')} aria-label="회의실 열기"><div className="meeting-table"><i /><i /><i /><i /><i /><i /></div><span className="door meeting-door">▾</span></button>
           <button className="room focus-room tool-button" type="button" onClick={() => setModal('computer')} aria-label="컴퓨터 현황 열기">
-            <div className="desk-row"><span className={`desk pc ${computerOwners[0].owner ? 'busy' : ''}`} /><span className={`desk pc ${computerOwners[1].owner ? 'busy' : ''}`} /></div><div className="desk-row"><span className={`desk pc ${computerOwners[2].owner ? 'busy' : ''}`} /><span className={`desk pc ${computerOwners[3].owner ? 'busy' : ''}`} /></div><span className="door lab-door">▾</span>
+            <div className="desk-row upper"><span className={`desk pc ${computerOwners[0].owner ? 'busy' : ''}`} /><span className={`desk pc ${computerOwners[1].owner ? 'busy' : ''}`} /></div><div className="desk-row lower"><span className={`desk pc ${computerOwners[2].owner ? 'busy' : ''}`} /><span className={`desk pc ${computerOwners[3].owner ? 'busy' : ''}`} /></div><span className="door lab-door">▾</span>
           </button>
           <div className="lounge-rug"><span /><span /><i /></div>
           <button className="whiteboard-object tool-button" type="button" onClick={() => setModal('whiteboard')} aria-label="화이트보드 열기"><b>{whiteboard.title}</b><span>{whiteboard.text}</span><em>열기</em></button>
