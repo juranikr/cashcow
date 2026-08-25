@@ -38,6 +38,17 @@ variable "container_port" {
   default = 8000
 }
 
+variable "browser_worker_port" {
+  type    = number
+  default = 8001
+}
+
+variable "browser_worker_instance_type" {
+  type        = string
+  default     = "t3.medium"
+  description = "Dedicated ECS EC2 host size for the sandboxed Chromium worker."
+}
+
 variable "listener_rule_priority" {
   type    = number
   default = 210

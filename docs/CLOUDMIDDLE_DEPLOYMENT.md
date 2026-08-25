@@ -1,49 +1,61 @@
-# cloudmiddle 방식 AWS 운영 전환
+# AWS 운영 배포
 
-`cloudmiddle`은 Vite 정적 프런트엔드와 FastAPI/PostgreSQL을 한 Docker 이미지로 만들고, GitHub OIDC → ECR → ECS Fargate로 배포합니다. Terraform이 VPC, ALB, ECS, RDS, ECR, Secrets Manager, CloudFront를 관리합니다.
+Cashcow는 `cloudmiddle`의 서울 리전 공유 VPC, public subnet, 런타임용 ECS
+cluster, ALB, CloudFront만 재사용합니다. Cashcow의 저장소, IAM, 로그와
+브라우저 워커 전용 ECS EC2 cluster는 별도 Terraform state로 관리합니다.
 
-Cashcow HQ의 현재 실행 대상은 Cloudflare Worker + D1이므로 같은 Dockerfile을 그대로 복사하면 정상 운영되지 않습니다. AWS 운영판은 UI를 재사용하고 아래의 authoritative backend를 먼저 추가한 뒤 `cloudmiddle` 파이프라인을 적용해야 합니다.
-
-## 목표 구성
+## 운영 경로
 
 ```text
-CloudFront → ALB (WebSocket 포함) → ECS Fargate
-                                      ├─ FastAPI world/API
-                                      └─ 정적 React UI
-                                             │
-                                      private RDS PostgreSQL
-
-EventBridge → Step Functions → one-off Fargate agent workers
-Secrets Manager → GROQ_API_KEY / DB credentials
-GitHub OIDC → ECR image push → immutable task revision → ECS deploy
+Sites(owner-only) -> CloudFront HTTPS -> ALB /cashcow/*
+                                        -> persistent runtime
+                                           -> DynamoDB
+                                           -> Groq HTTPS
+                                           -> internal NLB
+                                              -> dedicated ECS EC2 browser worker
+                                                -> public HTTPS GET/HEAD only
 ```
 
-## cloudmiddle에서 그대로 가져갈 관례
+런타임은 서버 권위형 world loop, 작업 계약과 체크포인트, 판단·도구 증거,
+에피소드·절차·교훈 기억, 역할 기반 협업 상태를 DynamoDB에 영속합니다.
+브라우저가 닫히거나 ECS 태스크가 교체되어도 동일 상태에서 미완료 작업을
+복구합니다.
 
-- 서울 리전 `ap-northeast-2`
-- 멀티스테이지 프런트엔드 + Python 이미지
-- 로컬 PostgreSQL Docker Compose와 healthcheck
-- SHA 이미지 태그, ECR, ECS 안정화 대기
-- Terraform S3 remote state + DynamoDB lock
-- GitHub Actions OIDC (장기 AWS access key 금지)
-- Groq 키와 DB 비밀번호의 Secrets Manager 주입
+브라우저 워커는 전용 ECS-optimized AL2023 EC2 호스트에서 실행합니다.
+비신뢰 사이트용 Chromium sandbox가 요구하는 custom seccomp를 Fargate가
+지원하지 않기 때문이며, sandbox 비활성화는 허용된 폴백이 아닙니다. 호스트는
+버전과 SHA를 고정한 Playwright seccomp, user namespace, 컨테이너의 사설·
+metadata 목적지 차단 방화벽을 모두 구성한 뒤에만 ECS에 등록됩니다.
 
-## Cashcow에서 보강할 점
+워커는 공개 listener 없이 내부 NLB를 통해서만 발견되며 런타임 security
+group만 8001 포트에 접근할 수 있습니다. task IAM role과 애플리케이션 비밀을
+받지 않고, 비-root, read-only rootfs, `no-new-privileges`, capability 전체 제거
+상태로 실행합니다. DNS 요청은 정확한 AmazonProvidedDNS resolver로만 제한하고,
+애플리케이션 콘텐츠는 공개 HTTPS와 검증·고정한 DNS 목적지만
+허용하고 외부 GET/HEAD 이외 요청, 자격증명 헤더, WebSocket, 다운로드,
+service worker, 로그인·전송·결제·삭제 조작을 차단합니다. 화면과 DOM/ARIA는
+비신뢰 관찰로 취급하고 각 행동 뒤 다시 관찰해 해시와 감사 증거를 남깁니다.
 
-- RDS는 private subnet에 두고 PostgreSQL ingress를 ECS security group에만 허용
-- ALB idle timeout보다 짧은 15~25초 WebSocket heartbeat
-- API/WS 경로의 CloudFront 캐시 비활성화
-- ECS desired count 1에서 시작하고 world leader는 PostgreSQL advisory lock 사용
-- 스크립트 실행은 API 컨테이너와 분리된 비특권 one-off task로 실행
-- `latest` 강제 재시작 대신 SHA가 고정된 task definition revision으로 롤백 가능하게 구성
-- 앱 workflow 전에 타입 검사, 단위 테스트, 빌드, DB migration 검사를 강제
+## 배포 게이트
 
-## 대표가 제공해야 하는 값
+`dev/predeploy.ps1`과 GitHub Quality workflow는 다음을 모두 검사합니다.
 
-1. 새 GitHub 저장소 또는 기존 저장소 이름과 기본 브랜치
-2. AWS 계정/리전, 운영 도메인, 예상 동시 사용자·에이전트 수
-3. GitHub OIDC role ARN과 Terraform remote-state bucket/table 이름
-4. 폐기·재발급한 Groq 키(Secrets Manager에만 등록)
-5. 주간 평가 알림을 인앱 외에 이메일/Slack으로도 보낼지 여부
+- TypeScript 타입, Vitest, ESLint, production build
+- 런타임과 브라우저 워커 Python compile/unit tests
+- 두 Docker 이미지의 실제 build와 동일 seccomp/권한 조건의 startup 및
+  공개 HTTPS 읽기 smoke
+- Terraform format/validate
+- 브라우저 SSRF, DNS rebinding, 비-GET/HEAD, 자격증명 헤더, 위험한 UI
+  동작 차단 테스트
 
-AWS 리소스 생성은 비용과 외부 변경이 발생하므로 이 값들이 확정된 뒤 별도 Terraform state로 적용합니다. `cloudmiddle`의 기존 state나 공개 RDS 규칙을 공유하지 않습니다.
+운영 배포는 브라우저 워커를 먼저 안정화한 뒤 런타임을 교체합니다. 후보
+이미지는 불변 commit SHA 태그로 보존하고 `latest`는 최초 bootstrap에만
+사용합니다. 실행 중 task의 image digest가 SHA 태그 digest와 일치하는지
+확인합니다. 런타임 공개 health의
+`buildSha`도 같은 SHA여야 합니다. 브라우저 task는 별도로 `HEALTHY`, task
+role 없음, secret 0개, 전용 호스트 attestation, IMDSv2 hop limit 1을
+확인합니다. EC2·public IPv4·gp3·내부 NLB의 반복 비용이 생기므로 저장된
+Terraform plan의 대상과 비용을 승인한 뒤에만 적용합니다.
+
+구체적인 Terraform 적용 순서, GitHub 변수, 배포 후 읽기 전용 확인 명령은
+[`infra/README.md`](../infra/README.md)에 있습니다.

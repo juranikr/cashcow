@@ -41,7 +41,10 @@ next-env.d.ts
 /runtime/.venv/
 /runtime/__pycache__/
 /runtime/*.pyc
+/browser_worker/__pycache__/
+/browser_worker/*.pyc
 /runtime/local-state*.json
+/.cashcow-local-state.json
 /runtime/*.log
 /infra/.terraform/
 /infra/*.tfstate*

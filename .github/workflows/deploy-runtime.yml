@@ -1,4 +1,4 @@
-name: Deploy runtime to AWS ECS
+name: Deploy runtime and isolated browser worker to AWS ECS
 
 on:
   workflow_dispatch:
@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - "runtime/**"
+      - "browser_worker/**"
       - ".github/workflows/deploy-runtime.yml"
 
 permissions:
@@ -18,76 +19,200 @@ concurrency:
 
 env:
   AWS_REGION: ap-northeast-2
+  PLAYWRIGHT_SECCOMP_URL: https://raw.githubusercontent.com/microsoft/playwright/v1.62.0/utils/docker/seccomp_profile.json
+  PLAYWRIGHT_SECCOMP_UPSTREAM_SHA256: cc3e61cabda6bbc1e53e54d27ba4d55a9d3be829b6dd1a596f4a7b31b1cc7849
+  PLAYWRIGHT_SECCOMP_DERIVED_SHA256: 0c1bd13c078cd9402f43f6c471e5a52f9b49fe89505ecabf1daac01ff1124283
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     if: ${{ vars.ENABLE_AWS_DEPLOY == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate deployment target configuration
+        env:
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          BROWSER_WORKER_ECR_REPOSITORY: ${{ vars.BROWSER_WORKER_ECR_REPOSITORY }}
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+          BROWSER_WORKER_ECS_CLUSTER: ${{ vars.BROWSER_WORKER_ECS_CLUSTER }}
+          BROWSER_WORKER_ECS_SERVICE: ${{ vars.BROWSER_WORKER_ECS_SERVICE }}
+          RUNTIME_HEALTH_URL: ${{ vars.RUNTIME_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          for name in ECR_REPOSITORY BROWSER_WORKER_ECR_REPOSITORY ECS_CLUSTER ECS_SERVICE BROWSER_WORKER_ECS_CLUSTER BROWSER_WORKER_ECS_SERVICE RUNTIME_HEALTH_URL; do
+            test -n "${!name:-}" || { echo "missing GitHub variable: $name" >&2; exit 1; }
+          done
+          test "$BROWSER_WORKER_ECS_CLUSTER" != "$ECS_CLUSTER" || { echo "browser worker must use its dedicated EC2 cluster" >&2; exit 1; }
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
-      - name: Install runtime dependencies
-        run: python -m pip install -r runtime/requirements.txt
+      - name: Install Python dependencies
+        run: python -m pip install -r runtime/requirements.txt -r browser_worker/requirements.txt
 
-      - name: Validate persistent runtime
+      - name: Validate persistent runtime and read-only browser policy
         run: |
-          python -m py_compile runtime/main.py runtime/engine.py runtime/storage.py runtime/world.py
+          set -euo pipefail
+          python -m py_compile runtime/main.py runtime/engine.py runtime/storage.py runtime/world.py runtime/browser_client.py runtime/browser_planner.py runtime/cognition.py
+          python -m py_compile browser_worker/main.py browser_worker/policy.py browser_worker/egress.py
           python -m unittest discover -s runtime -p 'test_*.py' -v
+          python -m unittest discover -s browser_worker -p 'test_*.py' -v
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Build candidate images
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build --provenance=false --build-arg "RUNTIME_BUILD_SHA=$IMAGE_TAG" -f runtime/Dockerfile -t "cashcow-runtime:$IMAGE_TAG" runtime
+          docker build --provenance=false --build-arg "BROWSER_WORKER_BUILD_SHA=$IMAGE_TAG" -f browser_worker/Dockerfile -t "cashcow-browser-worker:$IMAGE_TAG" browser_worker
+
+      - name: Verify candidate containers and sandboxed public read
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: bash dev/container-smoke.sh "$IMAGE_TAG"
+
+      - name: Configure AWS credentials (main-only OIDC)
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2
 
-      - name: Build and push runtime image
+      - name: Push immutable SHA tags
         env:
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          BROWSER_WORKER_ECR_REPOSITORY: ${{ vars.BROWSER_WORKER_ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           set -euo pipefail
-          docker build \
-            -f runtime/Dockerfile \
-            --build-arg "RUNTIME_BUILD_SHA=$IMAGE_TAG" \
-            -t "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
-            -t "$ECR_REGISTRY/$ECR_REPOSITORY:latest" \
-            runtime
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          for spec in \
+            "cashcow-runtime:$IMAGE_TAG|$ECR_REPOSITORY" \
+            "cashcow-browser-worker:$IMAGE_TAG|$BROWSER_WORKER_ECR_REPOSITORY"; do
+            local_image="${spec%%|*}"
+            repository="${spec##*|}"
+            remote_image="$ECR_REGISTRY/$repository:$IMAGE_TAG"
+            docker tag "$local_image" "$remote_image"
+            if ! aws ecr describe-images --repository-name "$repository" --image-ids imageTag="$IMAGE_TAG" --region "$AWS_REGION" >/dev/null 2>&1; then
+              docker push "$remote_image"
+            fi
+          done
 
-      - name: Deploy to ECS
+      - name: Block images with known critical vulnerabilities
         env:
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          BROWSER_WORKER_ECR_REPOSITORY: ${{ vars.BROWSER_WORKER_ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          for repository in "$ECR_REPOSITORY" "$BROWSER_WORKER_ECR_REPOSITORY"; do
+            aws ecr wait image-scan-complete --repository-name "$repository" --image-id imageTag="$IMAGE_TAG" --region "$AWS_REGION"
+            counts="$(aws ecr describe-image-scan-findings --repository-name "$repository" --image-id imageTag="$IMAGE_TAG" --region "$AWS_REGION" --query 'imageScanFindings.findingSeverityCounts' --output json)"
+            critical="$(jq -r '.CRITICAL // 0' <<<"$counts")"
+            high="$(jq -r '.HIGH // 0' <<<"$counts")"
+            echo "$repository scan: critical=$critical high=$high"
+            test "$critical" = "0" || { echo "refusing to deploy an image with critical findings" >&2; exit 1; }
+          done
+
+      - name: Register and deploy SHA-pinned browser task
+        id: browser-deploy
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          BROWSER_WORKER_ECR_REPOSITORY: ${{ vars.BROWSER_WORKER_ECR_REPOSITORY }}
+          BROWSER_WORKER_ECS_CLUSTER: ${{ vars.BROWSER_WORKER_ECS_CLUSTER }}
+          BROWSER_WORKER_ECS_SERVICE: ${{ vars.BROWSER_WORKER_ECS_SERVICE }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$BROWSER_WORKER_ECS_SERVICE" --region "$AWS_REGION" --query taskDefinition > task-definition.json
+          jq --arg image "$ECR_REGISTRY/$BROWSER_WORKER_ECR_REPOSITORY:$IMAGE_TAG" '
+            .containerDefinitions |= map(if .name == "browser-worker" then .image = $image else . end)
+            | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.deregisteredAt)
+          ' task-definition.json > browser-task-definition.json
+          task_definition="$(aws ecs register-task-definition --cli-input-json file://browser-task-definition.json --region "$AWS_REGION" --query 'taskDefinition.taskDefinitionArn' --output text)"
+          aws ecs update-service --cluster "$BROWSER_WORKER_ECS_CLUSTER" --service "$BROWSER_WORKER_ECS_SERVICE" --task-definition "$task_definition" --region "$AWS_REGION" >/dev/null
+          aws ecs wait services-stable --cluster "$BROWSER_WORKER_ECS_CLUSTER" --services "$BROWSER_WORKER_ECS_SERVICE" --region "$AWS_REGION"
+          echo "task_definition=$task_definition" >> "$GITHUB_OUTPUT"
+
+      - name: Verify browser worker isolation and image digest
+        env:
+          ECS_CLUSTER: ${{ vars.BROWSER_WORKER_ECS_CLUSTER }}
+          ECS_SERVICE: ${{ vars.BROWSER_WORKER_ECS_SERVICE }}
+          EXPECTED_TASK_DEFINITION: ${{ steps.browser-deploy.outputs.task_definition }}
+          ECR_REPOSITORY: ${{ vars.BROWSER_WORKER_ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          task_arn="$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" --desired-status RUNNING --region "$AWS_REGION" --query 'taskArns[0]' --output text)"
+          test -n "$task_arn" && test "$task_arn" != "None"
+          task_json="$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$task_arn" --region "$AWS_REGION")"
+          test "$(jq -r '.tasks[0].healthStatus' <<<"$task_json")" = "HEALTHY"
+          test "$(jq -r '.tasks[0].launchType' <<<"$task_json")" = "EC2"
+          test "$(jq -r '.tasks[0].taskDefinitionArn' <<<"$task_json")" = "$EXPECTED_TASK_DEFINITION"
+          task_definition_json="$(aws ecs describe-task-definition --task-definition "$EXPECTED_TASK_DEFINITION" --region "$AWS_REGION")"
+          test -z "$(jq -r '.taskDefinition.taskRoleArn // empty' <<<"$task_definition_json")"
+          test "$(jq -r '.taskDefinition.networkMode' <<<"$task_definition_json")" = "bridge"
+          test "$(jq -r '.taskDefinition.requiresCompatibilities | index("EC2") != null' <<<"$task_definition_json")" = "true"
+          test "$(jq '[.taskDefinition.containerDefinitions[] | select(.name == "browser-worker") | .secrets // []] | flatten | length' <<<"$task_definition_json")" = "0"
+          test "$(jq -r '.taskDefinition.containerDefinitions[] | select(.name == "browser-worker") | .user' <<<"$task_definition_json")" = "pwuser"
+          test "$(jq -r '.taskDefinition.containerDefinitions[] | select(.name == "browser-worker") | .readonlyRootFilesystem' <<<"$task_definition_json")" = "true"
+          test "$(jq -r '.taskDefinition.containerDefinitions[] | select(.name == "browser-worker") | .privileged' <<<"$task_definition_json")" = "false"
+          test "$(jq -r '.taskDefinition.containerDefinitions[] | select(.name == "browser-worker") | (.dockerSecurityOptions | index("no-new-privileges") != null)' <<<"$task_definition_json")" = "true"
+          test "$(jq -r '.taskDefinition.containerDefinitions[] | select(.name == "browser-worker") | (.linuxParameters.capabilities.drop | index("ALL") != null)' <<<"$task_definition_json")" = "true"
+          test "$(jq -r '.taskDefinition.executionRoleArn' <<<"$task_definition_json")" = "arn:aws:iam::$(aws sts get-caller-identity --query Account --output text):role/cashcow-prod-browser-worker-exec"
+          container_instance_arn="$(jq -r '.tasks[0].containerInstanceArn // empty' <<<"$task_json")"
+          test -n "$container_instance_arn"
+          container_instance_json="$(aws ecs describe-container-instances --cluster "$ECS_CLUSTER" --container-instances "$container_instance_arn" --region "$AWS_REGION")"
+          test "$(jq -r '.containerInstances[0].attributes[] | select(.name == "cashcow.browser-hardened") | .value' <<<"$container_instance_json")" = "playwright-v1.62.0-0c1bd13c078c"
+          ec2_instance_id="$(jq -r '.containerInstances[0].ec2InstanceId' <<<"$container_instance_json")"
+          instance_json="$(aws ec2 describe-instances --instance-ids "$ec2_instance_id" --region "$AWS_REGION")"
+          test "$(jq -r '.Reservations[0].Instances[0].MetadataOptions.HttpTokens' <<<"$instance_json")" = "required"
+          test "$(jq -r '.Reservations[0].Instances[0].MetadataOptions.HttpPutResponseHopLimit' <<<"$instance_json")" = "1"
+          expected_digest="$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$IMAGE_TAG" --region "$AWS_REGION" --query 'imageDetails[0].imageDigest' --output text)"
+          test "$(jq -r '.tasks[0].containers[0].imageDigest' <<<"$task_json")" = "$expected_digest"
+
+      - name: Register and deploy SHA-pinned runtime task
+        id: runtime-deploy
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition --task-definition "$ECS_SERVICE" --region "$AWS_REGION" --query taskDefinition > task-definition.json
+          jq --arg image "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" '
+            .containerDefinitions |= map(if .name == "runtime" then .image = $image else . end)
+            | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.deregisteredAt)
+          ' task-definition.json > runtime-task-definition.json
+          task_definition="$(aws ecs register-task-definition --cli-input-json file://runtime-task-definition.json --region "$AWS_REGION" --query 'taskDefinition.taskDefinitionArn' --output text)"
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --task-definition "$task_definition" --region "$AWS_REGION" >/dev/null
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" --region "$AWS_REGION"
+          echo "task_definition=$task_definition" >> "$GITHUB_OUTPUT"
+
+      - name: Verify production runtime and image digest
+        env:
+          HEALTH_URL: ${{ vars.RUNTIME_HEALTH_URL }}
+          EXPECTED_BUILD_SHA: ${{ github.sha }}
+          EXPECTED_TASK_DEFINITION: ${{ steps.runtime-deploy.outputs.task_definition }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
           ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
           ECS_SERVICE: ${{ vars.ECS_SERVICE }}
         run: |
           set -euo pipefail
-          aws ecs update-service \
-            --cluster "$ECS_CLUSTER" \
-            --service "$ECS_SERVICE" \
-            --force-new-deployment \
-            --region "$AWS_REGION" \
-            >/dev/null
-          aws ecs wait services-stable \
-            --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE" \
-            --region "$AWS_REGION"
-
-      - name: Verify production runtime
-        env:
-          HEALTH_URL: ${{ vars.RUNTIME_HEALTH_URL }}
-          EXPECTED_BUILD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
           health_json="$(curl --fail --silent --show-error --retry 6 --retry-delay 5 "$HEALTH_URL?build=$EXPECTED_BUILD_SHA")"
-          actual_build_sha="$(jq -r '.buildSha // empty' <<<"$health_json")"
-          test "$actual_build_sha" = "$EXPECTED_BUILD_SHA"
+          test "$(jq -r '.buildSha // empty' <<<"$health_json")" = "$EXPECTED_BUILD_SHA"
+          task_arn="$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" --desired-status RUNNING --region "$AWS_REGION" --query 'taskArns[0]' --output text)"
+          task_json="$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$task_arn" --region "$AWS_REGION")"
+          test "$(jq -r '.tasks[0].taskDefinitionArn' <<<"$task_json")" = "$EXPECTED_TASK_DEFINITION"
+          task_digest="$(jq -r '.tasks[0].containers[0].imageDigest' <<<"$task_json")"
+          expected_digest="$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$EXPECTED_BUILD_SHA" --region "$AWS_REGION" --query 'imageDetails[0].imageDigest' --output text)"
+          test "$task_digest" = "$expected_digest"

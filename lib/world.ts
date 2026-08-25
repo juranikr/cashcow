@@ -60,11 +60,24 @@ export type AgentReport = {
 
 export type Memory = {
   id: string;
-  kind: 'episode' | 'lesson';
+  kind: 'episode' | 'procedure' | 'lesson' | 'semantic';
   at: string;
   summary: string;
   evidence: string;
   confidence: number;
+};
+
+export type AgentCognition = {
+  disclosure?: string;
+  state?: {
+    simulatedAffect?: string;
+    currentHypothesis?: string;
+    openQuestions?: string[];
+    workingSet?: string[];
+    taskConfidence?: number;
+    uncertainty?: number;
+    commitmentStrength?: number;
+  };
 };
 
 export type AgentModel = {
@@ -89,6 +102,7 @@ export type AgentModel = {
   memories: Memory[];
   events?: WorkEvent[];
   report?: AgentReport;
+  cognition?: AgentCognition;
   activeJob?: {
     id: string;
     command: string;

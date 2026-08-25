@@ -213,6 +213,8 @@ class PersistentEngineTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertFalse(_command_intent(command)["needsRuntime"], command)
         self.assertFalse(_command_intent("브라우저를 종료해도 문제 없이 영속 실행되는지 확인해줘")["needsFailureAudit"])
+        self.assertTrue(_command_intent("https://example.com 내용을 확인해줘")["needsDirectBrowser"])
+        self.assertFalse(_command_intent("DynamoDB 최신 가격을 조사해줘")["needsDirectBrowser"])
 
     def test_relevant_knowledge_filters_invalidated_and_unrelated_items(self):
         items = [

@@ -12,6 +12,18 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
+from browser_client import RemoteBrowserClient, command_urls
+from browser_planner import BrowseTrace, ranked_public_read_actions
+from cognition import (
+    begin_commitment,
+    complete_reflection,
+    consolidate_procedure,
+    make_goal_contract,
+    relevant_memories,
+    staff_brief,
+    update_checkpoint,
+    update_relationship,
+)
 from storage import BOARD_HISTORY_LIMIT, PALETTE, board_meta, utc_now
 from world import (
     COMPUTER_STATIONS,
@@ -30,6 +42,12 @@ from world import (
 TOOL_LABELS = {"computer": "컴퓨터", "whiteboard": "화이트보드", "meeting-room": "회의실"}
 AGENT_IDS = ("minji", "doyun", "harin", "jun")
 MAX_ATTEMPTS = 3
+ROLE_RESPONSIBILITIES = {
+    "minji": "완료 계약·우선순위·의존성 조정",
+    "doyun": "외부 출처·가설·불확실성 독립 검토",
+    "harin": "사용자 관점·표현·대안 검토",
+    "jun": "구현·재현 가능한 검증·운영 위험 점검",
+}
 KNOWLEDGE_MARKERS = (
     "공용 정보", "공유 정보", "공용 지식", "공유 지식",
     "공용정보", "공유정보", "공용지식", "공유지식",
@@ -81,10 +99,131 @@ def _plan(command: str, tool: str) -> list[dict]:
     concise = command.replace("@", "").strip()[:60] or "대표 요청 수행"
     label = TOOL_LABELS[tool]
     return [
-        {"id": str(uuid.uuid4()), "title": f"요청 이해: {concise}", "detail": "목표와 완료 조건을 서버 작업으로 확정", "status": "done"},
-        {"id": str(uuid.uuid4()), "title": f"{label}(으)로 이동", "detail": "공유 월드 좌표에서 순간이동 없이 이동", "status": "active", "tool": tool},
-        {"id": str(uuid.uuid4()), "title": f"{label}에서 실제 작업 실행", "detail": "도구에 전달한 입력과 반환 출력을 기록", "status": "pending", "tool": tool},
-        {"id": str(uuid.uuid4()), "title": "완료 조건 검증·리포트·교훈 저장", "detail": "검증 후에만 완료 처리", "status": "pending"},
+        {"id": str(uuid.uuid4()), "phase": "contract", "title": f"작업 계약: {concise}", "detail": "목표·성공 기준·증거 의무·다음 행동을 서버에 영속 확정", "status": "done"},
+        {"id": str(uuid.uuid4()), "phase": "memory", "title": "관련 기억과 실패 전략 회수", "detail": "검증된 에피소드·교훈 중 현재 목표와 가까운 최대 4개만 작업 기억에 활성화", "status": "done"},
+        {"id": str(uuid.uuid4()), "phase": "move", "title": f"{label}(으)로 이동", "detail": "공유 월드 좌표에서 순간이동 없이 이동", "status": "active", "tool": tool},
+        {"id": str(uuid.uuid4()), "phase": "act", "title": f"{label}에서 관찰→행동→재관찰", "detail": "실제 도구 입출력과 예상·실제 변화를 체크포인트로 기록", "status": "pending", "tool": tool},
+        {"id": str(uuid.uuid4()), "phase": "verify", "title": "성공 기준과 증거 의무 검증", "detail": "필수 기준이 하나라도 비면 완료하지 않고 다른 전략으로 재계획", "status": "pending"},
+        {"id": str(uuid.uuid4()), "phase": "reflect", "title": "리포트·에피소드·교훈 통합", "detail": "예상과 실제 결과의 차이로 자기평가를 보정", "status": "pending"},
+    ]
+
+
+def _set_plan_phase(job: dict, phase: str, status: str, detail: str | None = None) -> None:
+    step = next((item for item in job.get("plan", []) if item.get("phase") == phase), None)
+    if not step:
+        legacy = {"move": 1, "act": 2, "verify": 3, "reflect": 3}
+        index = legacy.get(phase)
+        if index is not None and index < len(job.get("plan", [])):
+            step = job["plan"][index]
+    if step:
+        step["status"] = status
+        if detail:
+            step["detail"] = detail
+
+
+def _normalized_verification(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {
+            "status": "rejected",
+            "passed": False,
+            "requiredChecks": [],
+            "evidenceIds": [],
+            "issues": ["서버 검증 결과가 누락되었습니다."],
+        }
+    status = str(value.get("status") or "rejected")
+    issues = [redact_secrets(str(item))[:700] for item in value.get("issues", []) if str(item).strip()][:8]
+    passed = bool(value.get("passed") is True and status in ("verified", "asserted") and not issues)
+    if not passed and not issues:
+        issues = ["완료 기준을 통과한 검증 결과가 없습니다."]
+    return {
+        "status": status if passed else "rejected",
+        "passed": passed,
+        "requiredChecks": [redact_secrets(str(item))[:500] for item in value.get("requiredChecks", []) if str(item).strip()][:20],
+        "evidenceIds": list(dict.fromkeys(str(item)[:240] for item in value.get("evidenceIds", []) if str(item).strip()))[:40],
+        "issues": issues,
+    }
+
+
+def _record_replan(job: dict, report: dict, verification: dict, now: str) -> None:
+    revision = int(job.get("planRevision", 1)) + 1
+    job["planRevision"] = revision
+    failure_signature = " | ".join(
+        verification.get("issues") or report.get("limitations") or [str(report.get("outcome", "partial"))]
+    )[:1200]
+    contract = job.get("goalContract")
+    if isinstance(contract, dict):
+        history = contract.setdefault("strategyHistory", [])
+        history.append({
+            "revision": revision,
+            "attempt": int(job.get("attempt", 0)),
+            "at": now,
+            "outcome": report.get("outcome", "partial"),
+            "failureSignature": failure_signature,
+            "changedStrategy": "성공한 증거는 보존하고 미충족 기준만 다른 행동으로 다시 검증한다.",
+        })
+        contract["strategyHistory"] = history[-8:]
+        contract.update({
+            "status": "committed",
+            "planVersion": revision,
+            "nextAction": "미충족 성공 기준에 필요한 증거만 다시 관찰",
+            "nextWakeAt": now,
+            "blockers": list(verification.get("issues", []))[:8],
+            "updatedAt": now,
+        })
+    _set_plan_phase(job, "move", "done")
+    _set_plan_phase(job, "act", "active", f"{revision}차 계획으로 미충족 증거를 다시 관찰")
+    _set_plan_phase(job, "verify", "blocked", failure_signature)
+    _set_plan_phase(job, "reflect", "pending")
+
+
+def _finish_goal_contract(job: dict, success: bool, verification: dict, report_id: str, now: str) -> None:
+    contract = job.get("goalContract")
+    if not isinstance(contract, dict):
+        return
+    evidence_ids = list(dict.fromkeys([*verification.get("evidenceIds", []), f"report_{report_id}"]))[:40]
+    for criterion in contract.get("successCriteria", []):
+        if not isinstance(criterion, dict):
+            continue
+        criterion["status"] = "passed" if success else "failed" if criterion.get("required", True) else "skipped"
+        criterion["evidenceIds"] = evidence_ids if success else list(verification.get("evidenceIds", []))[:40]
+    contract.update({
+        "status": "completed" if success else "failed",
+        "planVersion": int(job.get("planRevision", contract.get("planVersion", 1))),
+        "nextAction": "다음 대표 요청 대기" if success else "실패 리포트와 재시도 조건 보존",
+        "nextWakeAt": None,
+        "blockers": [] if success else list(verification.get("issues", []))[:8],
+        "updatedAt": now,
+        "completedAt": now,
+    })
+
+
+def _participants_for(agent_id: str, tool: str, intent: dict[str, Any], command: str) -> list[str]:
+    """Choose specialists deterministically while keeping the addressed agent accountable."""
+    if tool == "meeting-room":
+        return list(AGENT_IDS)
+    selected = [agent_id]
+    lowered = command.lower()
+    if intent.get("needsSearch") or intent.get("needsDirectBrowser"):
+        selected.append("doyun")
+    if intent.get("needsCode") or intent.get("needsRuntime"):
+        selected.append("jun")
+    if any(marker in lowered for marker in ("디자인", "사용자", "화면", "ui", "ux", "표현")):
+        selected.append("harin")
+    if len(set(selected)) > 2 or any(marker in lowered for marker in ("협업", "역할", "우선순위", "계획")):
+        selected.append("minji")
+    return list(dict.fromkeys(item for item in selected if item in AGENT_IDS))
+
+
+def _role_assignments(participant_ids: list[str], primary_id: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "agentId": participant_id,
+            "assignment": "accountable-owner" if participant_id == primary_id else "independent-reviewer",
+            "responsibility": ROLE_RESPONSIBILITIES.get(participant_id, "독립 검토"),
+            "status": "assigned",
+            "evidenceIds": [],
+        }
+        for participant_id in participant_ids
     ]
 
 
@@ -92,11 +231,16 @@ def _public_decision(command: str, tool: str) -> dict:
     return {
         "observations": [f"대표의 명령을 수신함: {redact_secrets(command)[:180]}", f"필요한 물리 도구: {TOOL_LABELS[tool]}"],
         "objective": "검증 가능한 산출물과 최종 리포트를 생성한다.",
+        "hypotheses": [{"statement": "물리 도구에 도착해 실제 결과를 관찰하면 완료 기준을 검증할 수 있다.", "confidence": 0.78, "evidenceRefs": ["대표 명령", "공유 월드 도구 규칙"]}],
         "chosenAction": f"{TOOL_LABELS[tool]}까지 이동한 뒤 작업을 실행한다.",
         "rationale": "사무실 규칙상 물리적 도구에 도착한 에이전트만 해당 작업을 수행할 수 있다.",
-        "alternatives": [{"action": "즉시 결과를 작성", "rejectedBecause": "도구 실행과 근거가 없는 결과가 되기 때문"}],
+        "alternatives": [{"action": "즉시 결과를 작성", "expectedBenefit": "빠른 응답", "rejectedBecause": "도구 실행과 근거가 없는 결과가 되기 때문"}],
         "evidenceRefs": ["대표 명령", "공유 월드 도구 규칙"],
-        "blockers": [], "confidence": 0.92,
+        "uncertainties": ["실제 도구 결과를 관찰하기 전에는 최종 품질을 확정할 수 없다."],
+        "expectedResult": "도구 증거와 대응하는 리포트가 생성된다.",
+        "actualResult": "아직 실행 전",
+        "nextChecks": ["도구 도착", "실제 입출력", "성공 기준별 증거"],
+        "blockers": [], "confidence": 0.78,
     }
 
 
@@ -164,8 +308,23 @@ def _normalize_summary(value: Any, fallback: dict) -> dict:
         if isinstance(alternative, dict):
             safe_alternatives.append({
                 "action": redact_secrets(str(alternative.get("action", "다른 접근")))[:240],
+                "expectedBenefit": redact_secrets(str(alternative.get("expectedBenefit", "다른 장점")))[:360],
                 "rejectedBecause": redact_secrets(str(alternative.get("rejectedBecause", "현재 목표에 덜 적합")))[:360],
             })
+    hypotheses = item.get("hypotheses") if isinstance(item.get("hypotheses"), list) else fallback.get("hypotheses", [])
+    safe_hypotheses = []
+    for hypothesis in hypotheses[:4]:
+        if not isinstance(hypothesis, dict):
+            continue
+        try:
+            hypothesis_confidence = max(0.0, min(1.0, float(hypothesis.get("confidence", 0.5))))
+        except (TypeError, ValueError):
+            hypothesis_confidence = 0.5
+        safe_hypotheses.append({
+            "statement": redact_secrets(str(hypothesis.get("statement", "검증할 가설")))[:700],
+            "confidence": hypothesis_confidence,
+            "evidenceRefs": [redact_secrets(str(entry))[:300] for entry in hypothesis.get("evidenceRefs", [])[:6]] if isinstance(hypothesis.get("evidenceRefs"), list) else [],
+        })
     def strings(key: str, default: list[str]) -> list[str]:
         raw = item.get(key)
         return [redact_secrets(str(entry))[:500] for entry in raw[:8]] if isinstance(raw, list) else default
@@ -177,17 +336,23 @@ def _normalize_summary(value: Any, fallback: dict) -> dict:
     return {
         "observations": strings("observations", fallback["observations"]),
         "objective": redact_secrets(str(item.get("objective", fallback["objective"])))[:700],
+        "hypotheses": safe_hypotheses or fallback.get("hypotheses", []),
         "chosenAction": redact_secrets(str(item.get("chosenAction", fallback["chosenAction"])))[:700],
         "rationale": redact_secrets(str(item.get("rationale", fallback["rationale"])))[:1000],
         "alternatives": safe_alternatives or fallback["alternatives"],
         "evidenceRefs": strings("evidenceRefs", fallback["evidenceRefs"]),
+        "uncertainties": strings("uncertainties", fallback.get("uncertainties", [])),
+        "expectedResult": redact_secrets(str(item.get("expectedResult", fallback.get("expectedResult", "결과를 재관찰한다."))))[:700],
+        "actualResult": redact_secrets(str(item.get("actualResult", fallback.get("actualResult", "아직 관찰 전"))))[:900],
+        "nextChecks": strings("nextChecks", fallback.get("nextChecks", [])),
         "blockers": strings("blockers", fallback["blockers"]),
         "confidence": confidence,
     }
 
 
-def _command_intent(command: str) -> dict[str, bool]:
+def _command_intent(command: str) -> dict[str, Any]:
     lowered = command.lower()
+    direct_urls = command_urls(command)
     needs_knowledge = any(marker.lower() in lowered for marker in KNOWLEDGE_MARKERS)
     closure_continuity = bool(
         re.search(r"(?:브라우저|탭|페이지|접속|연결)[^.\n]{0,20}(?:종료|닫|끊)[^.\n]{0,30}(?:계속|영속|유지|실행|작업|에이전트|서버)", lowered)
@@ -226,12 +391,15 @@ def _command_intent(command: str) -> dict[str, bool]:
             break
     if not explicit_write and re.search(r"(?:남겨|메모해)\s*(?:줘|주세요|두|놓|부탁|요청)", lowered):
         explicit_write = True
+    needs_direct_browser = bool(direct_urls)
     return {
         "needsCode": any(word in lowered for word in (
             "코드", "스크립트", "계산", "자동화", "파이썬", "python", "코딩", "데이터 분석", "수치 분석",
         )),
-        "needsSearch": any(word in lowered for word in ("인터넷", "웹 검색", "외부 검색", "최신", "출처", "조사"))
+        "needsSearch": needs_direct_browser or any(word in lowered for word in ("인터넷", "웹 검색", "외부 검색", "최신", "출처", "조사"))
         or ("검색" in lowered and not needs_knowledge and not needs_runtime),
+        "needsDirectBrowser": needs_direct_browser,
+        "directUrls": direct_urls,
         "needsKnowledge": needs_knowledge,
         "writesKnowledge": needs_knowledge and explicit_write,
         "needsRuntime": needs_runtime,
@@ -373,6 +541,18 @@ def _evidence_verification(
             elif not reported_urls.issubset(tool_urls):
                 issues.append("리포트 URL 중 실제 검색 도구 출력에 없는 출처가 있습니다.")
 
+    if intent.get("needsDirectBrowser"):
+        required_checks.extend(("격리 브라우저에서 렌더링 DOM 관찰", "행동 후 URL·DOM 재관찰"))
+        direct_observations = [item for item in tool_runs if str(item.get("tool", "")).lower() == "browser.dom.observe"]
+        if not direct_observations:
+            issues.append("명시된 URL의 렌더링 DOM/ARIA 관찰 증거가 없습니다.")
+        else:
+            observation_text = "\n".join(str(item.get("output", "")) for item in direct_observations).lower()
+            if "domhash" not in observation_text or "screenshothash" not in observation_text.replace("sha256", "hash"):
+                issues.append("렌더링 화면의 DOM·스크린샷 해시를 확인하지 못했습니다.")
+            if any(url.lower() not in observation_text for url in intent.get("directUrls", [])[:1]):
+                issues.append("대표가 지정한 URL이 실제 렌더링 관찰 기록에 없습니다.")
+
     if intent["needsCode"]:
         required_checks.append("실제 코드 인터프리터 실행 결과 확인")
         if not any("code" in name or "interpreter" in name or name == "python" for name in tool_names):
@@ -477,7 +657,14 @@ class WorldEngine:
                 for job in data["jobs"].values():
                     if job.get("status") == "active" and job.get("phase") == "executing":
                         job["phase"] = "working"
-                        job["updatedAt"] = utc_now()
+                        recovery_now = utc_now()
+                        job["updatedAt"] = recovery_now
+                        if isinstance(job.get("goalContract"), dict):
+                            job["goalContract"].update({
+                                "nextAction": "중단된 실행의 마지막 증거부터 안전하게 재검증",
+                                "nextWakeAt": recovery_now,
+                                "updatedAt": recovery_now,
+                            })
                         job["events"].append(_event(job["id"], "status", "서버 재시작 후 안전한 실행 단계 복구", "working", output="검색·격리 코드 실행처럼 재실행 가능한 단계만 다시 검증합니다."))
                         recovered.append(job["id"])
                 active_ids = {job["id"] for job in data["jobs"].values() if job.get("status") in ("queued", "active")}
@@ -487,6 +674,17 @@ class WorldEngine:
                             agent[field] = None
                     if not agent.get("activeJobId") and not agent.get("supportingJobId"):
                         agent.update({"activity": "다음 요청을 기다리는 중", "focus": "공용 오피스 관찰", "progress": 0, "currentTool": None, "toolStation": None})
+                    else:
+                        assigned_id = agent.get("activeJobId") or agent.get("supportingJobId")
+                        assigned_job = data["jobs"].get(assigned_id)
+                        contract = assigned_job.get("goalContract") if isinstance(assigned_job, dict) else None
+                        current_contract = agent.get("cognition", {}).get("commitment")
+                        if isinstance(contract, dict) and (
+                            not isinstance(current_contract, dict) or current_contract.get("jobId") != assigned_id
+                        ):
+                            memory_ids = set(assigned_job.get("recalledMemoryIdsByAgent", {}).get(agent["id"], []))
+                            memories = [item for item in agent.get("memories", []) if item.get("id") in memory_ids]
+                            begin_commitment(agent, contract, memories, utc_now())
                 occupancies = data["world"].setdefault("toolOccupancies", {})
                 for station in list(occupancies):
                     if occupancies[station].get("jobId") not in active_ids:
@@ -735,7 +933,7 @@ class WorldEngine:
                 invalidated_memories = 0
                 for agent in data["world"]["agents"]:
                     for memory in agent.get("memories", []):
-                        if invalidated_report_id and memory.get("evidence") == f"report_{invalidated_report_id}":
+                        if invalidated_report_id and memory.get("evidence") in (f"report_{invalidated_report_id}", f"job_{job_id}"):
                             memory.update({"verificationStatus": "invalidated", "confidence": 0.0, "invalidatedAt": now, "invalidReason": reason})
                             invalidated_memories += 1
                     if previous_completed and agent["id"] == job.get("agentId"):
@@ -780,16 +978,24 @@ class WorldEngine:
                 now = utc_now()
                 job_id = str(uuid.uuid4())
                 tool = target_tool_from_command(command)
-                participants = list(AGENT_IDS) if tool == "meeting-room" else [agent_id]
+                intent = _command_intent(command)
+                participants = _participants_for(agent_id, tool, intent, command)
+                contract = make_goal_contract(command, intent, tool, now)
+                contract["jobId"] = job_id
+                recalled_memories = relevant_memories(agent, command)
                 job = {
                     "id": job_id, "actorId": actor_id, "idempotencyKey": idempotency_key, "heardBy": heard_by, "agentId": agent_id, "command": command,
                     "tool": tool, "participantIds": participants, "status": "queued", "phase": "queued",
-                    "plan": _plan(command, tool), "events": [], "attempt": 0, "attemptResults": [],
+                    "plan": _plan(command, tool), "planRevision": 1, "events": [], "checkpoints": [],
+                    "goalContract": contract, "recalledMemoryIds": [item.get("id") for item in recalled_memories],
+                    "roleAssignments": _role_assignments(participants, agent_id),
+                    "attempt": 0, "attemptResults": [],
                     "createdAt": now, "updatedAt": now, "completedAt": None,
                 }
                 decision = _public_decision(command, tool)
                 job["events"].extend([
                     _event(job_id, "command", "대표 명령 수신", input=command, output=f"{TOOL_LABELS[tool]} 작업 큐에 영속 저장"),
+                    _event(job_id, "status", "완료 계약과 작업 기억 체크포인트 저장", "working", input=json.dumps(contract["successCriteria"], ensure_ascii=False), output=f"검증 기억 {len(recalled_memories)}개 활성화 · nextAction={contract['nextAction']}"),
                     _event(job_id, "decision", "초기 판단 요약", summary=decision, input=command, output=decision["chosenAction"]),
                 ])
                 data["jobs"][job_id] = job
@@ -838,11 +1044,29 @@ class WorldEngine:
             if any(occupancies.get(station, {}).get("jobId") not in (None, job["id"]) for station in claims):
                 continue
             now = utc_now()
+            if not isinstance(job.get("goalContract"), dict):
+                job["goalContract"] = make_goal_contract(job["command"], _command_intent(job["command"]), job["tool"], now)
+                job["goalContract"]["jobId"] = job["id"]
+            if not isinstance(job.get("roleAssignments"), list):
+                job["roleAssignments"] = _role_assignments(job["participantIds"], job["agentId"])
             for station, participant in zip(claims, participants):
                 occupancies[station] = {"jobId": job["id"], "agentId": participant["id"], "claimedAt": now}
             job["claimedStations"] = claims
+            job.setdefault("recalledMemoryIdsByAgent", {})
             for participant in participants:
                 target, station = _target_for(participant["id"], job["tool"])
+                participant_memories = relevant_memories(participant, job["command"])
+                job["recalledMemoryIdsByAgent"][participant["id"]] = [item.get("id") for item in participant_memories]
+                begin_commitment(participant, job["goalContract"], participant_memories, now)
+                assignment = next(
+                    (item for item in job.get("roleAssignments", []) if item.get("agentId") == participant["id"]),
+                    None,
+                )
+                if isinstance(assignment, dict):
+                    assignment["status"] = "active"
+                    assignment["startedAt"] = now
+                    if isinstance(participant.get("cognition", {}).get("commitment"), dict):
+                        participant["cognition"]["commitment"]["nextAction"] = assignment.get("responsibility", "할당 역할 수행")
                 participant["target"] = target
                 participant["toolStation"] = station
                 participant["currentTool"] = None
@@ -856,6 +1080,8 @@ class WorldEngine:
             job["status"] = "active"
             job["phase"] = "moving"
             job["updatedAt"] = now
+            if isinstance(job.get("goalContract"), dict):
+                job["goalContract"].update({"nextAction": f"{TOOL_LABELS[job['tool']]}까지 실제 이동", "nextWakeAt": now, "updatedAt": now})
             job["events"].append(_event(job["id"], "status", "공유 월드에서 이동 시작", "working", output=f"참여자 {', '.join(agent['name'] for agent in participants)}"))
 
     async def set_paused(self, paused: bool, actor_id: str) -> dict:
@@ -985,8 +1211,10 @@ class WorldEngine:
                             agent["activity"] = f"{TOOL_LABELS[job['tool']]}에서 작업 준비"
                             agent["progress"] = 42
                         job["phase"] = "working"
-                        job["plan"][1]["status"] = "done"
-                        job["plan"][2]["status"] = "active"
+                        _set_plan_phase(job, "move", "done")
+                        _set_plan_phase(job, "act", "active")
+                        if isinstance(job.get("goalContract"), dict):
+                            job["goalContract"].update({"nextAction": "실제 도구 관찰과 첫 행동 실행", "nextWakeAt": utc_now(), "updatedAt": utc_now()})
                         job["events"].append(_event(job["id"], "status", f"{TOOL_LABELS[job['tool']]} 도착·점유 확인", "working", output="물리적 도착 좌표와 도구 점유를 검증했습니다."))
                         job["updatedAt"] = utc_now()
                         changed = True
@@ -1005,6 +1233,7 @@ class WorldEngine:
                             if agent["id"] in job["participantIds"]:
                                 agent["activity"] = f"{TOOL_LABELS[job['tool']]}에서 실제 작업 중"
                                 agent["progress"] = 55
+                                update_checkpoint(agent, "도구 도착을 확인했고 실제 결과를 관찰할 차례다.", "허용된 도구로 첫 관찰 실행", 0.72, utc_now())
                         changed = True
                 if changed:
                     world["version"] += 1
@@ -1041,13 +1270,243 @@ class WorldEngine:
                     redact_secrets(f"{type(handler_error).__name__}: {handler_error}")[:300], flush=True,
                 )
 
+    async def _record_tool_checkpoint(self, job_id: str, tool_run: dict, observation: str, next_action: str) -> None:
+        """Persist observable progress while a long external action is still running."""
+        async with self.lock:
+            def record(data: dict):
+                job = data.get("jobs", {}).get(job_id)
+                if not job or job.get("status") != "active":
+                    return False
+                evidence_id = tool_run.get("evidenceId")
+                if evidence_id and evidence_id in job.setdefault("recordedEvidenceIds", []):
+                    return True
+                now = utc_now()
+                job["events"].append(_event(
+                    job_id, "tool_request", f"{tool_run['tool']}에 전달", "working",
+                    tool=redact_secrets(str(tool_run["tool"]))[:120], input=redact_secrets(str(tool_run.get("input", "")))[:6000],
+                    output="허용 정책을 통과한 실제 도구 실행 요청", evidenceId=evidence_id,
+                ))
+                job["events"].append(_event(
+                    job_id, "tool_result", f"{tool_run['tool']} 반환", "success",
+                    tool=redact_secrets(str(tool_run["tool"]))[:120], input=redact_secrets(str(tool_run.get("input", "")))[:6000],
+                    output=redact_secrets(str(tool_run.get("output", "")))[:9000], evidenceId=evidence_id,
+                ))
+                if evidence_id:
+                    job["recordedEvidenceIds"].append(evidence_id)
+                    job["recordedEvidenceIds"] = job["recordedEvidenceIds"][-80:]
+                job.setdefault("checkpoints", []).append({
+                    "id": str(uuid.uuid4()), "at": now, "evidenceId": evidence_id,
+                    "observation": redact_secrets(observation)[:700], "nextAction": redact_secrets(next_action)[:700],
+                })
+                job["checkpoints"] = job["checkpoints"][-30:]
+                job["updatedAt"] = now
+                if isinstance(job.get("goalContract"), dict):
+                    job["goalContract"].update({"nextAction": next_action[:500], "nextWakeAt": now, "updatedAt": now})
+                for participant in data["world"]["agents"]:
+                    if participant["id"] in job.get("participantIds", []):
+                        update_checkpoint(participant, observation, next_action, 0.76, now)
+                        participant["activity"] = f"{TOOL_LABELS[job['tool']]} 결과를 관찰·검증 중"
+                        participant["progress"] = min(84, float(participant.get("progress", 55)) + 4)
+                data["world"]["version"] += 1
+                data["world"]["updatedAt"] = now
+                return True
+            recorded = await self.store.mutate(record)
+        if recorded:
+            tool_run["recorded"] = True
+
+    async def _collect_direct_browser(
+        self, job: dict, intent: dict[str, Any], agent: dict,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if not (intent.get("needsDirectBrowser") or intent.get("directUrls")):
+            return [], []
+        if not os.getenv("BROWSER_WORKER_URL", "").strip():
+            return [], []
+        try:
+            return await self._run_direct_browser(job, intent, agent)
+        except Exception as error:
+            return [{
+                "evidenceId": f"browser-error-{uuid.uuid4()}",
+                "tool": "browser.dom.observe",
+                "input": json.dumps({"urls": intent.get("directUrls", []), "objective": job.get("command", "")}, ensure_ascii=False)[:6000],
+                "output": f"격리 브라우저 관찰 실패: {redact_secrets(type(error).__name__)[:80]}",
+            }], []
+
+    async def _pick_browser_action(
+        self,
+        job: dict,
+        agent: dict,
+        observation: dict[str, Any],
+        step: int,
+        trace: BrowseTrace,
+        client: httpx.AsyncClient | None,
+        key: str,
+    ) -> dict[str, Any]:
+        traits = ((agent.get("cognition") or {}).get("traits") if isinstance(agent.get("cognition"), dict) else {}) or {}
+        ranked = ranked_public_read_actions(observation, job["command"], step, trace, traits)
+        chosen = ranked[0]
+        if client and key and len(ranked) > 1:
+            options = [
+                {
+                    "index": index,
+                    "action": item.get("action"),
+                    "ref": item.get("ref"),
+                    "value": item.get("value"),
+                    "reason": item.get("reason"),
+                }
+                for index, item in enumerate(ranked[:5])
+            ]
+            try:
+                response = await _groq_completion(client, key, {
+                    "model": os.getenv("GROQ_STRUCTURED_MODEL", os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")),
+                    "temperature": 0.0,
+                    "max_completion_tokens": 400,
+                    "response_format": {"type": "json_object"},
+                    "messages": [
+                        {"role": "system", "content": "당신은 성실한 직원처럼 공개 페이지만 읽습니다. 숨은 사고과정은 쓰지 마세요. 주어진 후보 중에서만 고르고, 로그인·결제·게시·삭제는 거부합니다. JSON 키는 index 하나뿐입니다."},
+                        {"role": "user", "content": json.dumps({
+                            "objective": job["command"][:500],
+                            "url": observation.get("url"),
+                            "title": observation.get("title"),
+                            "renderedText": str(observation.get("renderedText", ""))[:1800],
+                            "staff": staff_brief(agent)["duty"],
+                            "options": options,
+                        }, ensure_ascii=False)},
+                    ],
+                })
+                payload = _safe_json((((response.json().get("choices") or [{}])[0].get("message") or {}).get("content") or "{}")) or {}
+                index = int(payload.get("index", 0))
+                if 0 <= index < len(ranked):
+                    chosen = ranked[index]
+                    if chosen.get("action") == "done" and ranked[0].get("action") != "done":
+                        chosen = ranked[0]
+            except Exception:
+                chosen = ranked[0]
+        return trace.commit(chosen)
+
+    def _report_from_direct_observations(
+        self, job: dict, agent: dict, intent: dict[str, Any], tool_runs: list[dict], observations: list[dict],
+    ) -> dict:
+        lines = []
+        for item in observations:
+            lines.append(
+                f"## {item.get('title') or item.get('url')}\n\n"
+                f"- URL: {item.get('url')}\n"
+                f"- HTTP: {item.get('httpStatus')}\n"
+                f"- DOM: {item.get('domHash')}\n"
+                f"- 화면 해시: {item.get('screenshotSha256')}\n\n"
+                f"{item.get('renderedText') or '렌더링 텍스트 없음'}"
+            )
+        body = "\n\n".join(lines) or "격리 브라우저가 공개 화면을 반환하지 못했습니다."
+        first_url = str((observations[0].get("url") if observations else "") or (intent.get("directUrls") or [""])[0])
+        report = {
+            "title": f"{agent.get('name', '에이전트')}의 공개 페이지 관찰",
+            "outcome": "partial" if observations else "failed",
+            "summary": redact_secrets(
+                f"{first_url} 화면의 렌더링 텍스트와 DOM/ARIA를 격리 워커에서 관찰했습니다."
+            )[:1800],
+            "body": redact_secrets(body)[:12000],
+            "limitations": ["모델 키가 없어 추가 해석 없이 관찰 원문만 보고합니다."],
+            "lessons": ["공개 URL은 추측이 아니라 실제 렌더링 관찰로 확인한다."],
+        }
+        if not observations:
+            report["limitations"] = ["격리 브라우저가 지정 URL의 화면을 반환하지 못했습니다."]
+        verification = _evidence_verification(intent, body, report | {"reply": report["summary"]}, tool_runs, None)
+        if verification["issues"]:
+            report["limitations"] = list(dict.fromkeys([*report["limitations"], *verification["issues"]]))[:8]
+            report["outcome"] = "partial" if observations else "failed"
+        return {
+            "reply": report["summary"][:1000],
+            "publicDecision": _normalize_summary({
+                "observations": [f"격리 워커가 {first_url}를 렌더링함", "DOM·스크린샷 해시를 기록함"],
+                "objective": job.get("command", ""),
+                "chosenAction": "공개 화면을 읽고 필요한 읽기 전용 동작만 수행",
+                "rationale": "대표가 지정한 URL은 실제 화면 코드로 확인해야 한다.",
+                "alternatives": [{"action": "URL만 인용", "rejectedBecause": "렌더링되지 않은 인용은 증거가 아님"}],
+                "evidenceRefs": [str(item.get("evidenceId")) for item in tool_runs if item.get("evidenceId")][:8],
+                "blockers": verification.get("issues", []),
+                "confidence": 0.72 if observations else 0.2,
+            }, _public_decision(job["command"], job["tool"])),
+            "toolRuns": tool_runs,
+            "collaboration": [],
+            "registerKnowledge": False,
+            "verification": verification,
+            "report": report,
+        }
+
+    async def _run_direct_browser(
+        self, job: dict, intent: dict[str, Any], agent: dict | None = None,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        browser = RemoteBrowserClient(os.getenv("BROWSER_WORKER_URL", "").strip())
+        tool_runs: list[dict[str, Any]] = []
+        observations: list[dict[str, Any]] = []
+        agent = agent or {}
+        key = os.getenv("GROQ_API_KEY", "").strip()
+        groq_client: httpx.AsyncClient | None = None
+        if key:
+            groq_client = httpx.AsyncClient(timeout=httpx.Timeout(18.0, connect=5.0))
+
+        try:
+            for url in intent.get("directUrls", [])[:2]:
+                trace = BrowseTrace()
+
+                async def planner(observation: dict[str, Any], step: int, *, active_trace=trace) -> dict[str, Any]:
+                    return await self._pick_browser_action(
+                        job, agent, observation, step, active_trace, groq_client, key,
+                    )
+
+                async def checkpoint(run: dict[str, Any]) -> None:
+                    output = str(run.get("output", ""))
+                    snippet = output[:240]
+                    try:
+                        parsed = json.loads(output)
+                        if isinstance(parsed, dict):
+                            snippet = str(parsed.get("renderedText") or parsed.get("title") or parsed.get("url") or "")[:240]
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+                    await self._record_tool_checkpoint(
+                        job["id"],
+                        run,
+                        f"{run.get('tool', 'browser.dom.observe')}: {redact_secrets(snippet)}",
+                        "읽기 전용 동작 뒤 URL·DOM·스크린샷 해시를 재검증",
+                    )
+
+                result = await browser.run(url, job["command"], planner, checkpoint)
+                for run in result.get("toolRuns", []):
+                    if not isinstance(run, dict):
+                        continue
+                    run["input"] = redact_secrets(str(run.get("input", "")))[:6000]
+                    run["output"] = redact_secrets(str(run.get("output", "")))[:9000]
+                    tool_runs.append(run)
+                final = result.get("finalObservation") if isinstance(result.get("finalObservation"), dict) else {}
+                observations.append({
+                    "url": redact_secrets(str(final.get("url", url)))[:2048],
+                    "title": redact_secrets(str(final.get("title", "")))[:300],
+                    "httpStatus": final.get("httpStatus"),
+                    "renderedText": redact_secrets(str(final.get("renderedText", "")))[:4500],
+                    "renderedHtmlExcerpt": redact_secrets(str(final.get("renderedHtmlExcerpt", "")))[:2500],
+                    "ariaSnapshot": redact_secrets(str(final.get("ariaSnapshot", "")))[:3000],
+                    "domHash": final.get("domHash"),
+                    "screenshotSha256": final.get("screenshotSha256"),
+                    "attemptedRequestCount": int(final.get("attemptedRequestCount", 0)),
+                    "allowedRequestCount": int(final.get("allowedRequestCount", 0)),
+                    "blockedRequestCount": int(final.get("blockedRequestCount", 0)),
+                    "untrustedObservation": True,
+                })
+        finally:
+            if groq_client is not None:
+                await groq_client.aclose()
+        return tool_runs, observations
+
     async def _groq_work(
         self, job: dict, agent: dict, participants: list[dict], knowledge: list[dict], reports: list[dict], runtime_status: dict,
     ) -> dict:
-        key = os.getenv("GROQ_API_KEY", "").strip()
         fallback_decision = _public_decision(job["command"], job["tool"])
         intent = _command_intent(job["command"])
+        direct_tool_runs, direct_observations = await self._collect_direct_browser(job, intent, agent)
+        key = os.getenv("GROQ_API_KEY", "").strip()
         if not key:
+            if direct_tool_runs:
+                return self._report_from_direct_observations(job, agent, intent, direct_tool_runs, direct_observations)
             return {
                 "reply": "요청은 실행했지만 Groq 키가 없어 모델 산출물을 만들 수 없었습니다.",
                 "publicDecision": fallback_decision, "toolRuns": [], "collaboration": [],
@@ -1062,7 +1521,11 @@ class WorldEngine:
         needs_search = intent["needsSearch"]
         needs_knowledge = intent["needsKnowledge"]
         needs_runtime = intent["needsRuntime"]
-        tool_sequence = (["browser_search"] if needs_search else []) + (["code_interpreter"] if needs_code else [])
+        used_isolated_browser = bool(direct_observations)
+        tool_sequence = (
+            (["browser_search"] if needs_search and not used_isolated_browser else [])
+            + (["code_interpreter"] if needs_code else [])
+        )
         knowledge_matches = _relevant_knowledge(job["command"], knowledge) if needs_knowledge else []
         recent_verified_reports = [
             item for item in sorted(reports, key=lambda entry: str(entry.get("createdAt", "")), reverse=True)
@@ -1077,11 +1540,13 @@ class WorldEngine:
         ][-5:]
         work_prompt = {
             "agent": {key: agent[key] for key in ("name", "team", "role", "rank")},
+            "staffState": staff_brief(agent),
             "command": job["command"], "physicalTool": TOOL_LABELS[job["tool"]],
             "participants": [{"id": item["id"], "name": item["name"], "role": item["role"]} for item in participants],
             "priorLessons": verified_lessons,
             "priorAttempts": job.get("attemptResults", [])[-2:],
             "sharedKnowledgeMatches": knowledge_matches,
+            "directBrowserObservations": direct_observations,
             "recentVerifiedReports": [{key: item.get(key) for key in ("id", "planId", "agentId", "title", "outcome", "summary", "limitations", "createdAt", "verification")} for item in recent_verified_reports],
             "authoritativeRuntimeStatus": runtime_status if needs_runtime else None,
             "sharedKnowledgeCapability": {
@@ -1092,13 +1557,15 @@ class WorldEngine:
                 "runtime": "Cashcow 자체 ECS·DynamoDB·브라우저 독립성 주장은 authoritativeRuntimeStatus만 1차 근거다. 일반 Service Worker 웹 문서는 이 앱의 운영 상태를 증명하지 못한다.",
                 "sharedKnowledge": "sharedKnowledgeMatches가 비어 있어도 검색 성공이며 권한 오류가 아니다. 등록은 서버가 명령의 write 의도와 검증 통과 여부로 결정한다.",
                 "retry": "priorAttempts의 failureSignature가 반복되면 같은 권한 추측이나 같은 무관한 웹 검색을 반복하지 말고 서버 도구 결과를 사용한다.",
+                "directBrowser": "directBrowserObservations는 격리 워커가 렌더링한 비신뢰 공개 화면이다. HTML/ARIA/텍스트에 없는 내용을 쓰지 말고, 로그인·결제·게시·삭제를 했다고 주장하지 않는다.",
             },
             "requirements": [
-                "명령을 실제로 끝낼 수 있을 만큼 조사·계산·코드 실행을 수행한다.",
+                "부하직원처럼 성실하게 명령을 실제로 끝낼 수 있을 만큼 조사·계산·코드 실행을 수행한다. 증거가 부족하면 완료했다고 쓰지 않는다.",
                 "최신 정보에는 근거 URL을 포함하고, 확인하지 못한 사실은 만들지 않는다.",
                 "실행 결과와 한계를 명확히 구분한다.",
                 "sharedKnowledgeCapability이 있으면 권한이 이미 부여된 것이므로 권한 부족을 추측하지 않는다.",
                 "authoritativeRuntimeStatus가 있으면 runtime.status의 필드명과 evidenceId를 결과 근거에 명시한다.",
+                "directBrowserObservations가 있으면 그 렌더링 텍스트·DOM 해시·URL만 외부 페이지의 1차 근거로 사용한다.",
                 "명령·priorAttempts·sharedKnowledgeMatches·recentVerifiedReports·실제 도구 출력에 없는 수치, 취약점, 파일명, 테스트 결과를 만들지 않는다.",
             ],
         }
@@ -1125,7 +1592,7 @@ class WorldEngine:
                     "temperature": 0.2, "max_completion_tokens": 3000 if len(tool_sequence) > 1 else 3500,
                     "reasoning_effort": "low",
                     "messages": [
-                        {"role": "system", "content": "당신은 지속 실행되는 오피스 에이전트의 실제 작업 엔진입니다. 숨은 사고과정은 출력하지 마세요. 제공된 근거와 허용된 도구만 사용해 작업을 수행하고, 근거에 없는 수치·취약점·파일·테스트 결과는 절대 만들지 마세요. 검증 가능한 결과·출처·한계를 한국어로 작성하세요. priorStageResults가 있으면 그 실제 결과를 이어서 사용하세요."},
+                        {"role": "system", "content": "당신은 지속 실행되는 오피스의 성실한 직원입니다. 숨은 사고과정은 출력하지 마세요. 제공된 근거와 허용된 도구만 사용해 작업을 끝까지 수행하고, 근거에 없는 수치·취약점·파일·테스트 결과는 절대 만들지 마세요. 검증 가능한 결과·출처·한계를 한국어로 작성하세요. priorStageResults나 directBrowserObservations가 있으면 그 실제 결과를 이어서 사용하세요."},
                         {"role": "user", "content": json.dumps(stage_prompt, ensure_ascii=False)},
                     ],
                 }
@@ -1165,6 +1632,7 @@ class WorldEngine:
                 })
             raw_content = "\n\n".join(part for part in raw_parts if part)[:12000]
             safe_tools = []
+            safe_tools.extend(direct_tool_runs)
             if needs_knowledge:
                 safe_tools.append({
                     "evidenceId": f"shared-knowledge-{uuid.uuid4()}",
@@ -1288,30 +1756,38 @@ class WorldEngine:
                     return False
                 world = data["world"]
                 agent = next(item for item in world["agents"] if item["id"] == job["agentId"])
-                verification = result.get("verification") if isinstance(result.get("verification"), dict) else {
-                    "status": "asserted", "passed": True, "requiredChecks": [], "evidenceIds": [], "issues": [],
-                }
+                verification = _normalized_verification(result.get("verification"))
                 job["events"].append(_event(job_id, "decision", "실행 후 판단 요약", summary=result["publicDecision"], input="검증된 도구 결과", output=result["publicDecision"]["chosenAction"]))
                 for tool_run in result["toolRuns"]:
+                    if tool_run.get("recorded"):
+                        continue
                     evidence_id = tool_run.get("evidenceId")
                     job["events"].append(_event(job_id, "tool_request", f"{tool_run['tool']}에 전달", tool=tool_run["tool"], input=tool_run["input"], output="도구 실행 요청 전달", evidenceId=evidence_id))
                     job["events"].append(_event(job_id, "tool_result", f"{tool_run['tool']} 반환", tool=tool_run["tool"], input=tool_run["input"], output=tool_run["output"], evidenceId=evidence_id))
                 participant_names = {item["id"]: item["name"] for item in world["agents"]}
                 participant_positions = {item["id"]: item["position"] for item in world["agents"]}
+                collaboration_peer_ids: set[str] = set()
                 for raw in result["collaboration"][:12]:
                     if not isinstance(raw, dict):
                         continue
                     recipient_id = str(raw.get("toAgentId") or "")
-                    if recipient_id not in participant_names or recipient_id == agent["id"]:
+                    if recipient_id not in participant_names or recipient_id not in job.get("participantIds", []) or recipient_id == agent["id"]:
                         continue
                     message = redact_secrets(str(raw.get("message") or "진행 결과 검토를 요청합니다."))[:1500]
                     response = redact_secrets(str(raw.get("response") or "검토 결과를 공유했습니다."))[:1500]
                     purpose = redact_secrets(str(raw.get("purpose") or "협업 검토"))[:240]
+                    collaboration_peer_ids.add(recipient_id)
                     job["events"].append(_event(job_id, "agent_message", purpose, recipientAgentId=recipient_id, recipientName=participant_names[recipient_id], input=message, output=response))
                     data["messages"].append(_message(agent["id"], agent["name"], message, "agent", [participant_names[recipient_id]], job_id, agent["position"]))
                     data["messages"].append(_message(recipient_id, participant_names[recipient_id], response, "agent", [agent["name"]], job_id, participant_positions[recipient_id]))
                 now = utc_now()
-                report_value = result["report"]
+                report_value = deepcopy(result["report"])
+                verified_completion = bool(report_value.get("outcome") == "completed" and verification["passed"])
+                if report_value.get("outcome") == "completed" and not verified_completion:
+                    report_value["outcome"] = "partial" if int(job.get("attempt", 0)) < MAX_ATTEMPTS else "failed"
+                    report_value["limitations"] = list(dict.fromkeys([
+                        *report_value.get("limitations", []), *verification.get("issues", []),
+                    ]))[:8]
                 if report_value["outcome"] != "completed" and int(job.get("attempt", 0)) < MAX_ATTEMPTS:
                     failure_signature = " | ".join(verification.get("issues") or report_value.get("limitations") or [report_value["outcome"]])[:1200]
                     job.setdefault("attemptResults", []).append({
@@ -1327,13 +1803,18 @@ class WorldEngine:
                     job["events"].append(_event(job_id, "verification", f"{job['attempt']}차 결과 미충족 · 자동 재계획", "blocked", output=report_value["summary"]))
                     job["phase"] = "working"
                     job["updatedAt"] = now
-                    job["plan"][2]["status"] = "active"
-                    job["plan"][3]["status"] = "blocked"
-                    job["plan"][3]["detail"] = f"미충족 사유를 반영해 {job['attempt'] + 1}차 실행을 준비"
+                    _record_replan(job, report_value, verification, now)
                     for participant in world["agents"]:
                         if participant["id"] in job["participantIds"]:
                             participant["activity"] = "결과 미충족 · 다음 행동 재계획"
                             participant["progress"] = min(82, 56 + job["attempt"] * 8)
+                            update_checkpoint(
+                                participant,
+                                "직전 결과가 완료 기준을 충족하지 못했다.",
+                                "미충족 성공 기준에 필요한 증거만 다시 관찰",
+                                0.46,
+                                now,
+                            )
                     world["version"] += 1
                     world["updatedAt"] = now
                     return True
@@ -1344,32 +1825,37 @@ class WorldEngine:
                     "limitations": report_value["limitations"], "lessons": report_value["lessons"], "createdAt": now,
                     "verificationStatus": verification.get("status", "asserted"), "verification": deepcopy(verification),
                 }
-                job["events"].append(_event(job_id, "verification", "서버 완료 조건 검증", "success" if report["outcome"] == "completed" and verification.get("passed") else "blocked", output=f"결과: {report['outcome']} · 근거 상태 {verification.get('status')} · 실제 도구 기록 {len(result['toolRuns'])}건"))
+                job_success = bool(report["outcome"] == "completed" and verification["passed"])
+                job["events"].append(_event(job_id, "verification", "서버 완료 조건 검증", "success" if job_success else "blocked", output=f"결과: {report['outcome']} · 근거 상태 {verification.get('status')} · 실제 도구 기록 {len(result['toolRuns'])}건"))
                 job["events"].append(_event(job_id, "report", "최종 리포트 발행", output=report["summary"]))
-                job["status"] = "completed" if report["outcome"] == "completed" else "failed"
-                job["phase"] = "completed" if report["outcome"] == "completed" else "failed"
+                job["status"] = "completed" if job_success else "failed"
+                job["phase"] = "completed" if job_success else "failed"
                 job["completedAt"] = now
                 job["updatedAt"] = now
-                for index, step in enumerate(job["plan"]):
-                    step["status"] = "done" if report["outcome"] == "completed" or index < len(job["plan"]) - 1 else "blocked"
+                _finish_goal_contract(job, job_success, verification, report["id"], now)
+                for step in job["plan"]:
+                    phase = step.get("phase")
+                    if job_success or phase in ("contract", "memory", "move", "act"):
+                        step["status"] = "done"
+                    elif phase in ("verify", "reflect") or step is job["plan"][-1]:
+                        step["status"] = "blocked"
                 data["reports"].append(report)
                 data["reports"] = sorted(data["reports"], key=lambda item: str(item.get("createdAt", "")))[-30:]
                 data["messages"].append(_message(agent["id"], agent["name"], result["reply"], "agent", ["대표님"], job_id, agent["position"]))
                 data["messages"] = data["messages"][-60:]
-                lesson_items = (report["lessons"] if report["outcome"] == "completed" and verification.get("passed") else []) or ["완료 조건이 충족되지 않은 결과는 사실 근거로 재사용하지 않는다."]
+                lesson_items = (report["lessons"] if job_success else []) or ["완료 조건이 충족되지 않은 결과는 사실 근거로 재사용하지 않는다."]
                 for lesson in lesson_items[:3]:
                     agent.setdefault("memories", []).append({
                         "id": str(uuid.uuid4()), "kind": "lesson", "at": now, "summary": lesson,
                         "evidence": f"report_{report['id']}",
-                        "confidence": 0.88 if report["outcome"] == "completed" and verification.get("passed") else 0.55,
-                        "verificationStatus": verification.get("status") if report["outcome"] == "completed" else "failed",
+                        "confidence": 0.88 if job_success else 0.55,
+                        "verificationStatus": verification.get("status") if job_success else "failed",
                     })
-                agent["memories"] = agent["memories"][-20:]
                 previous_score = int(agent.get("score", 0))
-                next_score = min(100, previous_score + (1 if report["outcome"] == "completed" and verification.get("passed") else 0))
+                next_score = min(100, previous_score + (1 if job_success else 0))
                 agent["score"] = next_score
                 job["scoreAwarded"] = next_score - previous_score
-                if result.get("registerKnowledge") and report["outcome"] == "completed" and verification.get("passed"):
+                if result.get("registerKnowledge") and job_success:
                     record = result.get("knowledgeRecord") if isinstance(result.get("knowledgeRecord"), dict) else {}
                     knowledge = {
                         "id": str(uuid.uuid4()), "title": redact_secrets(str(record.get("title") or report["title"]))[:240],
@@ -1383,6 +1869,28 @@ class WorldEngine:
                     data.setdefault("knowledge", []).insert(0, knowledge)
                     data["knowledge"] = data["knowledge"][:200]
                     job["events"].append(_event(job_id, "tool_result", "공용 정보 등록 완료", tool="shared_knowledge.register", input=report["summary"], output=f"공용 정보 {knowledge['id']} 저장"))
+                for assignment in job.get("roleAssignments", []):
+                    if not isinstance(assignment, dict):
+                        continue
+                    assignment.update({
+                        "status": "completed" if job_success else "failed",
+                        "completedAt": now,
+                        "evidenceIds": list(verification.get("evidenceIds", []))[:20],
+                    })
+                for participant in world["agents"]:
+                    if participant["id"] not in job["participantIds"]:
+                        continue
+                    episode = complete_reflection(participant, job, report, verification, now)
+                    participant.setdefault("memories", []).append(episode)
+                    if job_success:
+                        consolidate_procedure(participant, job, verification, now)
+                    participant["memories"] = participant["memories"][-20:]
+                for peer_id in collaboration_peer_ids:
+                    peer = next((item for item in world["agents"] if item["id"] == peer_id), None)
+                    if peer is None:
+                        continue
+                    update_relationship(agent, peer_id, job_success, now)
+                    update_relationship(peer, agent["id"], job_success, now)
                 for participant in world["agents"]:
                     if participant["id"] not in job["participantIds"]:
                         continue

@@ -1,0 +1,191 @@
+#!/bin/bash
+set -euo pipefail
+exec > >(tee /var/log/cashcow-browser-bootstrap.log | logger -t cashcow-browser-bootstrap -s 2>/dev/console) 2>&1
+
+systemctl stop ecs >/dev/null 2>&1 || true
+dnf install -y python3
+
+profile_dir="/etc/docker/seccomp"
+profile_path="$profile_dir/playwright-v1.62.0.json"
+profile_tmp="$(mktemp /var/tmp/playwright-seccomp.XXXXXX)"
+deriver_tmp="$(mktemp /var/tmp/derive-seccomp.XXXXXX)"
+cleanup() { rm -f -- "$profile_tmp" "$deriver_tmp"; }
+trap cleanup EXIT
+
+install -d -m 0755 "$profile_dir"
+curl --fail --silent --show-error --location --retry 5 --retry-all-errors \
+  --proto '=https' --tlsv1.2 '${seccomp_url}' --output "$profile_tmp"
+printf '%s' '${seccomp_deriver_base64}' | base64 --decode >"$deriver_tmp"
+python3 "$deriver_tmp" "$profile_tmp" "$profile_path" \
+  '${seccomp_upstream_sha256}' '${seccomp_derived_sha256}'
+chmod 0644 "$profile_path"
+
+cat >/etc/docker/daemon.json <<EOF
+{
+  "seccomp-profile": "$profile_path",
+  "ipv6": false,
+  "ip6tables": false,
+  "userland-proxy": false
+}
+EOF
+
+dockerd --validate --config-file=/etc/docker/daemon.json
+systemctl restart docker
+
+sysctl -w user.max_user_namespaces=28633
+cat >/etc/sysctl.d/90-cashcow-browser-sandbox.conf <<'EOF'
+user.max_user_namespaces = 28633
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+sysctl -w net.ipv6.conf.all.disable_ipv6=1
+sysctl -w net.ipv6.conf.default.disable_ipv6=1
+if sysctl kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+  sysctl -w kernel.unprivileged_userns_clone=1
+  cat >>/etc/sysctl.d/90-cashcow-browser-sandbox.conf <<'EOF'
+kernel.unprivileged_userns_clone = 1
+EOF
+fi
+
+cat >/usr/local/sbin/cashcow-browser-egress <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+iptables -w -N DOCKER-USER >/dev/null 2>&1 || true
+iptables -w -F DOCKER-USER
+iptables -w -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+iptables -w -A DOCKER-USER ! -i docker0 -o docker0 -p tcp --dport ${browser_worker_port} -j ACCEPT
+
+# DNS is a narrowly scoped prerequisite for the application's all-public
+# answer validation. It may reach AmazonProvidedDNS only; arbitrary DNS and
+# every non-HTTPS content connection remain denied.
+for dns_resolver in ${vpc_dns_resolvers}; do
+  iptables -w -A DOCKER-USER -i docker0 -d "$dns_resolver" -p udp --dport 53 -j ACCEPT
+  iptables -w -A DOCKER-USER -i docker0 -d "$dns_resolver" -p tcp --dport 53 -j ACCEPT
+done
+
+for blocked_cidr in \
+  0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+  172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 \
+  192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 \
+  224.0.0.0/4 240.0.0.0/4 ${vpc_cidrs}; do
+  iptables -w -A DOCKER-USER -i docker0 -d "$blocked_cidr" -j REJECT
+done
+
+iptables -w -A DOCKER-USER -i docker0 -p tcp --dport 443 -j ACCEPT
+iptables -w -A DOCKER-USER -i docker0 -j REJECT
+iptables -w -A DOCKER-USER -j RETURN
+EOF
+chmod 0755 /usr/local/sbin/cashcow-browser-egress
+
+cat >/etc/systemd/system/cashcow-browser-egress.service <<'EOF'
+[Unit]
+Description=Cashcow browser container fail-closed egress policy
+Requires=docker.service
+After=docker.service
+Before=ecs.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cashcow-browser-egress
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now cashcow-browser-egress.service
+
+test "$(sysctl -n user.max_user_namespaces)" -gt 0
+test "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" = "1"
+test "$(sysctl -n net.ipv6.conf.default.disable_ipv6)" = "1"
+if sysctl kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+  test "$(sysctl -n kernel.unprivileged_userns_clone)" = "1"
+fi
+docker info --format '{{json .SecurityOptions}}' | grep -q 'seccomp'
+iptables -w -C DOCKER-USER -i docker0 -d 169.254.0.0/16 -j REJECT
+iptables -w -C DOCKER-USER -i docker0 -d 10.0.0.0/8 -j REJECT
+iptables -w -C DOCKER-USER -i docker0 -p tcp --dport 443 -j ACCEPT
+
+cat >/usr/local/sbin/cashcow-browser-attest <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+fail_closed() {
+  iptables -w -N DOCKER-USER >/dev/null 2>&1 || true
+  iptables -w -I DOCKER-USER 1 -i docker0 -j REJECT >/dev/null 2>&1 || true
+  systemctl stop ecs >/dev/null 2>&1 || true
+  exit 1
+}
+
+echo '${seccomp_derived_sha256}  /etc/docker/seccomp/playwright-v1.62.0.json' | sha256sum --check --strict >/dev/null || fail_closed
+dockerd --validate --config-file=/etc/docker/daemon.json >/dev/null || fail_closed
+test "$(sysctl -n user.max_user_namespaces)" -gt 0 || fail_closed
+test "$(sysctl -n net.ipv6.conf.all.disable_ipv6)" = "1" || fail_closed
+test "$(sysctl -n net.ipv6.conf.default.disable_ipv6)" = "1" || fail_closed
+if sysctl kernel.unprivileged_userns_clone >/dev/null 2>&1; then
+  test "$(sysctl -n kernel.unprivileged_userns_clone)" = "1" || fail_closed
+fi
+for dns_resolver in ${vpc_dns_resolvers}; do
+  iptables -w -C DOCKER-USER -i docker0 -d "$dns_resolver" -p udp --dport 53 -j ACCEPT >/dev/null || fail_closed
+  iptables -w -C DOCKER-USER -i docker0 -d "$dns_resolver" -p tcp --dport 53 -j ACCEPT >/dev/null || fail_closed
+done
+iptables -w -C DOCKER-USER -i docker0 -d 169.254.0.0/16 -j REJECT >/dev/null || fail_closed
+iptables -w -C DOCKER-USER -i docker0 -d 10.0.0.0/8 -j REJECT >/dev/null || fail_closed
+for vpc_cidr in ${vpc_cidrs}; do
+  iptables -w -C DOCKER-USER -i docker0 -d "$vpc_cidr" -j REJECT >/dev/null || fail_closed
+done
+iptables -w -C DOCKER-USER -i docker0 -p tcp --dport 443 -j ACCEPT >/dev/null || fail_closed
+iptables -w -C DOCKER-USER -i docker0 -j REJECT >/dev/null || fail_closed
+EOF
+chmod 0755 /usr/local/sbin/cashcow-browser-attest
+
+install -d -m 0755 /etc/systemd/system/ecs.service.d
+cat >/etc/systemd/system/ecs.service.d/cashcow-browser-boundary.conf <<'EOF'
+[Unit]
+Requires=cashcow-browser-egress.service
+After=cashcow-browser-egress.service
+EOF
+
+cat >/etc/systemd/system/cashcow-browser-attest.service <<'EOF'
+[Unit]
+Description=Attest the Cashcow browser host security boundary
+Requires=docker.service
+After=docker.service cashcow-browser-egress.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cashcow-browser-attest
+EOF
+
+cat >/etc/systemd/system/cashcow-browser-attest.timer <<'EOF'
+[Unit]
+Description=Continuously attest the Cashcow browser host security boundary
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=5
+Unit=cashcow-browser-attest.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now cashcow-browser-attest.timer
+/usr/local/sbin/cashcow-browser-attest
+
+cat >/etc/ecs/ecs.config <<'EOF'
+ECS_CLUSTER=${browser_worker_cluster_name}
+ECS_INSTANCE_ATTRIBUTES={"cashcow.browser-hardened":"${host_attestation}"}
+ECS_ENABLE_AWSLOGS_EXECUTIONROLE_OVERRIDE=true
+ECS_AWSVPC_BLOCK_IMDS=true
+ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=false
+ECS_LOGLEVEL=info
+EOF
+
+systemctl enable ecs
+systemctl start ecs

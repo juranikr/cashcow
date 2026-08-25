@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from cognition import default_cognition, ensure_agent_cognition
+
 
 PALETTE = ["#f9f4df", "#ef7657", "#e4b34f", "#55a47c", "#4d8fb8", "#745f9d", "#26394f"]
 BOARD_HISTORY_LIMIT = 30
@@ -75,6 +77,37 @@ def ensure_data_shape(data: dict) -> bool:
     if "knowledge" not in data:
         data["knowledge"] = []
         changed = True
+    agent_ids = [str(agent.get("id", "")) for agent in world.get("agents", [])]
+    migration_now = utc_now()
+    for agent in world.get("agents", []):
+        if ensure_agent_cognition(agent, agent_ids, migration_now):
+            changed = True
+        normalized_memories = []
+        for memory in agent.get("memories", []):
+            if not isinstance(memory, dict):
+                changed = True
+                continue
+            if memory.get("kind") not in ("episode", "semantic", "procedure", "lesson"):
+                memory["kind"] = "lesson"
+                changed = True
+            normalized_memories.append(memory)
+        if normalized_memories != agent.get("memories", []):
+            agent["memories"] = normalized_memories
+            changed = True
+    for job in data.get("jobs", {}).values():
+        if not isinstance(job, dict):
+            continue
+        phase_names = ("contract", "move", "act", "verify") if len(job.get("plan", [])) == 4 else ()
+        for index, step in enumerate(job.get("plan", [])):
+            if "phase" not in step and index < len(phase_names):
+                step["phase"] = phase_names[index]
+                changed = True
+        if "planRevision" not in job:
+            job["planRevision"] = 1
+            changed = True
+        if "checkpoints" not in job:
+            job["checkpoints"] = []
+            changed = True
     for block in data["board"].get("textBlocks", []):
         created_at = block.get("createdAt") or data["board"].get("updatedAt") or utc_now()
         defaults = {
@@ -100,18 +133,20 @@ def utc_now() -> str:
 
 
 def _agent(agent_id: str, name: str, team: str, role: str, rank: str, tone: str, x: float, y: float, score: int) -> dict:
+    now = utc_now()
     return {
         "id": agent_id, "name": name, "team": team, "role": role, "rank": rank, "tone": tone,
         "position": {"x": x, "y": y}, "facing": "south", "target": {"x": x, "y": y},
         "activity": "다음 요청을 기다리는 중", "focus": "공용 오피스 관찰", "progress": 0,
         "score": score, "visible": True, "currentTool": None, "toolStation": None,
         "activeJobId": None, "supportingJobId": None, "plan": [], "events": [], "memories": [],
+        "cognition": default_cognition(agent_id, now), "relationships": {},
     }
 
 
 def initial_world() -> dict:
     now = utc_now()
-    return {
+    world = {
         "id": "main", "version": 1, "paused": False, "updatedAt": now,
         "lastTickAt": now, "players": {}, "toolOccupancies": {}, "appliedReviews": {},
         "agents": [
@@ -121,6 +156,10 @@ def initial_world() -> dict:
             _agent("jun", "준", "플랫폼팀", "소프트웨어 엔지니어", "시니어", "mint", 44, 69, 94),
         ],
     }
+    agent_ids = [agent["id"] for agent in world["agents"]]
+    for agent in world["agents"]:
+        ensure_agent_cognition(agent, agent_ids, now)
+    return world
 
 
 def initial_board() -> dict:
@@ -289,6 +328,8 @@ class DynamoStore:
         return {"pk": pk, "sk": sk, "entity": entity, "payload": json.dumps(payload, ensure_ascii=False, separators=(",", ":")), **extra}
 
     def _persist_delta(self, before: dict, after: dict, expected_revision: int) -> None:
+        from boto3.dynamodb.types import TypeSerializer
+
         items: list[dict] = []
         if before.get("world") != after.get("world"):
             items.append(self._json_item("WORLD#main", "STATE", "world", after["world"]))
@@ -315,15 +356,20 @@ class DynamoStore:
             if before_knowledge.get(knowledge["id"]) != knowledge:
                 items.append(self._json_item("KNOWLEDGE", f"{knowledge['createdAt']}#{knowledge['id']}", "knowledge", knowledge))
 
+        serializer = TypeSerializer()
+
+        def serialize_item(item: dict) -> dict:
+            return {key: serializer.serialize(value) for key, value in item.items()}
+
         commit = self._json_item("META#world", "COMMIT", "commit", {"revision": int(after["revision"])}, revision=int(after["revision"]))
         commit_put = {
             "TableName": self.table.name,
-            "Item": commit,
+            "Item": serialize_item(commit),
             "ConditionExpression": "attribute_not_exists(#revision) OR #revision = :expected",
             "ExpressionAttributeNames": {"#revision": "revision"},
-            "ExpressionAttributeValues": {":expected": int(expected_revision)},
+            "ExpressionAttributeValues": {":expected": serializer.serialize(int(expected_revision))},
         }
-        actions = [{"Put": {"TableName": self.table.name, "Item": item}} for item in items]
+        actions = [{"Put": {"TableName": self.table.name, "Item": serialize_item(item)}} for item in items]
         actions.append({"Put": commit_put})
         if len(actions) > 100:
             raise RuntimeError("한 번의 월드 트랜잭션이 DynamoDB 100개 작업 한도를 초과했습니다.")
