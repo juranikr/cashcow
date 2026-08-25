@@ -328,8 +328,6 @@ class DynamoStore:
         return {"pk": pk, "sk": sk, "entity": entity, "payload": json.dumps(payload, ensure_ascii=False, separators=(",", ":")), **extra}
 
     def _persist_delta(self, before: dict, after: dict, expected_revision: int) -> None:
-        from boto3.dynamodb.types import TypeSerializer
-
         items: list[dict] = []
         if before.get("world") != after.get("world"):
             items.append(self._json_item("WORLD#main", "STATE", "world", after["world"]))
@@ -356,20 +354,15 @@ class DynamoStore:
             if before_knowledge.get(knowledge["id"]) != knowledge:
                 items.append(self._json_item("KNOWLEDGE", f"{knowledge['createdAt']}#{knowledge['id']}", "knowledge", knowledge))
 
-        serializer = TypeSerializer()
-
-        def serialize_item(item: dict) -> dict:
-            return {key: serializer.serialize(value) for key, value in item.items()}
-
         commit = self._json_item("META#world", "COMMIT", "commit", {"revision": int(after["revision"])}, revision=int(after["revision"]))
         commit_put = {
             "TableName": self.table.name,
-            "Item": serialize_item(commit),
+            "Item": commit,
             "ConditionExpression": "attribute_not_exists(#revision) OR #revision = :expected",
             "ExpressionAttributeNames": {"#revision": "revision"},
-            "ExpressionAttributeValues": {":expected": serializer.serialize(int(expected_revision))},
+            "ExpressionAttributeValues": {":expected": int(expected_revision)},
         }
-        actions = [{"Put": {"TableName": self.table.name, "Item": serialize_item(item)}} for item in items]
+        actions = [{"Put": {"TableName": self.table.name, "Item": item}} for item in items]
         actions.append({"Put": commit_put})
         if len(actions) > 100:
             raise RuntimeError("한 번의 월드 트랜잭션이 DynamoDB 100개 작업 한도를 초과했습니다.")

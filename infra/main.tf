@@ -195,6 +195,7 @@ resource "aws_iam_role_policy" "task_dynamodb" {
     Statement = [{
       Effect = "Allow"
       Action = [
+        "dynamodb:PutItem",
         "dynamodb:Scan",
         "dynamodb:TransactWriteItems",
       ]
