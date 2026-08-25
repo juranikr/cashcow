@@ -63,3 +63,15 @@ variable "github_repo" {
   type    = string
   default = "cashcow"
 }
+
+variable "github_org_id" {
+  type        = string
+  default     = "295397696"
+  description = "Immutable GitHub owner ID used in the OIDC subject claim."
+}
+
+variable "github_repo_id" {
+  type        = string
+  default     = "1343838593"
+  description = "Immutable GitHub repository ID used in the OIDC subject claim."
+}
