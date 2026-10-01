@@ -22,7 +22,7 @@ resource "aws_ecs_cluster" "browser_worker" {
 
   setting {
     name  = "containerInsights"
-    value = "enabled"
+    value = var.hibernated ? "disabled" : "enabled"
   }
 
   tags = { Project = "cashcow", Environment = "prod", Boundary = "public-read-only" }
@@ -171,9 +171,9 @@ resource "aws_launch_template" "browser_worker" {
 
 resource "aws_autoscaling_group" "browser_worker" {
   name_prefix         = "${var.name_prefix}-browser-"
-  min_size            = 1
-  max_size            = 2
-  desired_capacity    = 1
+  min_size            = var.hibernated ? 0 : 1
+  max_size            = var.hibernated ? 0 : 2
+  desired_capacity    = var.hibernated ? 0 : 1
   vpc_zone_identifier = var.public_subnet_ids
   health_check_type   = "EC2"
 
@@ -205,7 +205,6 @@ resource "aws_autoscaling_group" "browser_worker" {
 
   lifecycle {
     create_before_destroy = true
-    ignore_changes        = [desired_capacity]
   }
 }
 
@@ -240,6 +239,8 @@ resource "aws_ecs_cluster_capacity_providers" "browser_worker" {
 }
 
 resource "aws_lb" "browser_worker" {
+  count = var.hibernated ? 0 : 1
+
   name                             = "${var.name_prefix}-browser-nlb"
   internal                         = true
   load_balancer_type               = "network"
@@ -252,6 +253,8 @@ resource "aws_lb" "browser_worker" {
 }
 
 resource "aws_lb_target_group" "browser_worker" {
+  count = var.hibernated ? 0 : 1
+
   name        = "${var.name_prefix}-browser"
   port        = var.browser_worker_port
   protocol    = "TCP"
@@ -275,13 +278,15 @@ resource "aws_lb_target_group" "browser_worker" {
 }
 
 resource "aws_lb_listener" "browser_worker" {
-  load_balancer_arn = aws_lb.browser_worker.arn
+  count = var.hibernated ? 0 : 1
+
+  load_balancer_arn = aws_lb.browser_worker[0].arn
   port              = var.browser_worker_port
   protocol          = "TCP"
 
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.browser_worker.arn
+    target_group_arn = aws_lb_target_group.browser_worker[0].arn
   }
 }
 
@@ -308,16 +313,20 @@ resource "aws_ecs_task_definition" "browser_worker" {
     readonlyRootFilesystem = true
     privileged             = false
     dockerSecurityOptions  = ["no-new-privileges"]
+    environment            = []
     portMappings           = [{ containerPort = var.browser_worker_port, hostPort = var.browser_worker_port, protocol = "tcp" }]
     linuxParameters = {
       initProcessEnabled = true
       sharedMemorySize   = 512
-      capabilities       = { drop = ["ALL"] }
+      capabilities       = { add = [], drop = ["ALL"] }
       tmpfs = [
         { containerPath = "/tmp", size = 512, mountOptions = ["rw", "nosuid", "nodev"] },
         { containerPath = "/home/pwuser", size = 128, mountOptions = ["rw", "noexec", "nosuid", "nodev", "uid=1001", "gid=1001", "mode=0700"] },
       ]
     }
+    mountPoints    = []
+    systemControls = []
+    volumesFrom    = []
     logConfiguration = {
       logDriver = "awslogs"
       options = {
@@ -351,7 +360,7 @@ resource "aws_ecs_service" "browser_worker" {
   name                  = "${var.name_prefix}-browser-worker"
   cluster               = aws_ecs_cluster.browser_worker.arn
   task_definition       = aws_ecs_task_definition.browser_worker.arn
-  desired_count         = 1
+  desired_count         = var.hibernated ? 0 : 1
   wait_for_steady_state = true
 
   capacity_provider_strategy {
@@ -373,10 +382,14 @@ resource "aws_ecs_service" "browser_worker" {
     rollback = true
   }
 
-  load_balancer {
-    target_group_arn = aws_lb_target_group.browser_worker.arn
-    container_name   = "browser-worker"
-    container_port   = var.browser_worker_port
+  dynamic "load_balancer" {
+    for_each = var.hibernated ? [] : [1]
+
+    content {
+      target_group_arn = aws_lb_target_group.browser_worker[0].arn
+      container_name   = "browser-worker"
+      container_port   = var.browser_worker_port
+    }
   }
 
   depends_on = [

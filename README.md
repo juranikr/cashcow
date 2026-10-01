@@ -66,3 +66,29 @@ npm run build
 배포됩니다. 장기 AWS 키와 Groq 키는 GitHub에 저장하지 않습니다. Sites
 화면 변경은 모든 빌드 검사를 자동 수행하고, ChatGPT 로그인·D1 바인딩을
 소유한 Sites 배포 경로에서 게시합니다.
+
+## AWS 휴면 및 복구
+
+현재 AWS 인프라는 비용을 최소화하는 휴면 상태가 기본값입니다. 휴면 적용 시
+두 ECS 작업과 전용 브라우저 EC2/EBS를 0대로 축소하고, 전용 내부 NLB와 대상
+그룹을 제거합니다. DynamoDB 데이터(PITR 및 별도 온디맨드 백업), ECR의 최신
+배포 이미지, Secrets Manager 비밀값, S3의 Terraform 상태는 보존됩니다.
+
+휴면 중에는 AWS 런타임 API가 응답하지 않습니다. 다시 운영하려면 먼저 다음과
+같이 계획을 검토하고 적용한 뒤 GitHub Actions 배포 플래그를 켜고 배포합니다.
+
+```powershell
+Set-Location infra
+terraform plan -var="hibernated=false"
+terraform apply -var="hibernated=false"
+gh variable set ENABLE_AWS_DEPLOY --body true
+gh workflow run deploy-runtime.yml --ref main
+```
+
+NLB를 다시 만들면 내부 주소가 바뀌므로 마지막 워크플로 실행은 필수입니다.
+워크플로가 새 주소를 포함한 task definition을 배포한 뒤 런타임 health와 실제
+브라우저 조회 smoke test까지 확인합니다.
+
+다시 휴면하려면 `hibernated=true`로 계획·적용하고
+`ENABLE_AWS_DEPLOY=false`를 유지합니다. 전체 `terraform destroy`는 보존 자원에
+대한 보호 규칙으로 차단됩니다.

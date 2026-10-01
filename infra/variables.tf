@@ -8,6 +8,12 @@ variable "name_prefix" {
   default = "cashcow-prod"
 }
 
+variable "hibernated" {
+  type        = bool
+  default     = true
+  description = "Keep durable data and deployment artifacts while removing billable runtime compute and the dedicated browser NLB."
+}
+
 variable "shared_cluster_name" {
   type    = string
   default = "tourmiddle-dev-cluster"

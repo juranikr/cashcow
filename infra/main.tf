@@ -25,6 +25,8 @@ resource "aws_ecr_repository" "runtime" {
   }
 
   tags = { Project = "cashcow", Environment = "prod" }
+
+  lifecycle { prevent_destroy = true }
 }
 
 resource "aws_ecr_lifecycle_policy" "runtime" {
@@ -32,11 +34,11 @@ resource "aws_ecr_lifecycle_policy" "runtime" {
   policy = jsonencode({
     rules = [{
       rulePriority = 1
-      description  = "Keep the latest 12 runtime images"
+      description  = var.hibernated ? "Keep the latest 2 runtime images while hibernated" : "Keep the latest 12 runtime images"
       selection = {
         tagStatus   = "any"
         countType   = "imageCountMoreThan"
-        countNumber = 12
+        countNumber = var.hibernated ? 2 : 12
       }
       action = { type = "expire" }
     }]
@@ -57,6 +59,8 @@ resource "aws_ecr_repository" "browser_worker" {
   }
 
   tags = { Project = "cashcow", Environment = "prod", Boundary = "public-read-only" }
+
+  lifecycle { prevent_destroy = true }
 }
 
 resource "aws_ecr_lifecycle_policy" "browser_worker" {
@@ -64,11 +68,11 @@ resource "aws_ecr_lifecycle_policy" "browser_worker" {
   policy = jsonencode({
     rules = [{
       rulePriority = 1
-      description  = "Keep the latest 12 browser worker images"
+      description  = var.hibernated ? "Keep the latest 2 browser worker images while hibernated" : "Keep the latest 12 browser worker images"
       selection = {
         tagStatus   = "any"
         countType   = "imageCountMoreThan"
-        countNumber = 12
+        countNumber = var.hibernated ? 2 : 12
       }
       action = { type = "expire" }
     }]
@@ -94,12 +98,16 @@ resource "aws_dynamodb_table" "world" {
   point_in_time_recovery { enabled = true }
 
   tags = { Project = "cashcow", Environment = "prod" }
+
+  lifecycle { prevent_destroy = true }
 }
 
 resource "aws_secretsmanager_secret" "runtime" {
   name                    = "${var.name_prefix}-runtime"
   recovery_window_in_days = 7
   tags                    = { Project = "cashcow", Environment = "prod" }
+
+  lifecycle { prevent_destroy = true }
 }
 
 resource "aws_cloudwatch_log_group" "runtime" {
@@ -292,7 +300,7 @@ resource "aws_ecs_task_definition" "runtime" {
     environment = [
       { name = "AWS_REGION", value = var.aws_region },
       { name = "DYNAMODB_TABLE", value = aws_dynamodb_table.world.name },
-      { name = "BROWSER_WORKER_URL", value = "http://${aws_lb.browser_worker.dns_name}:${var.browser_worker_port}" },
+      { name = "BROWSER_WORKER_URL", value = var.hibernated ? "http://127.0.0.1:9" : "http://${aws_lb.browser_worker[0].dns_name}:${var.browser_worker_port}" },
       { name = "GROQ_MODEL", value = "openai/gpt-oss-120b" },
       { name = "GROQ_STRUCTURED_MODEL", value = "openai/gpt-oss-120b" },
     ]
@@ -310,8 +318,11 @@ resource "aws_ecs_task_definition" "runtime" {
     }
     linuxParameters = {
       initProcessEnabled = true
-      capabilities       = { drop = ["ALL"] }
+      capabilities       = { add = [], drop = ["ALL"] }
     }
+    mountPoints    = []
+    systemControls = []
+    volumesFrom    = []
     healthCheck = {
       command     = ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/cashcow/health')\" || exit 1"]
       interval    = 30
@@ -334,7 +345,7 @@ resource "aws_ecs_service" "runtime" {
   name                  = "${var.name_prefix}-runtime"
   cluster               = data.aws_ecs_cluster.shared.arn
   task_definition       = aws_ecs_task_definition.runtime.arn
-  desired_count         = 1
+  desired_count         = var.hibernated ? 0 : 1
   launch_type           = "FARGATE"
   wait_for_steady_state = true
 
