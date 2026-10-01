@@ -29,7 +29,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# The fully patched Ubuntu base marks its system Python as externally managed.
+# This is an isolated container image, so install into that image explicitly.
+RUN python -m pip install --break-system-packages --no-cache-dir -r requirements.txt
 COPY main.py policy.py egress.py ./
 RUN chown -R pwuser:pwuser /app /home/pwuser
 USER pwuser
